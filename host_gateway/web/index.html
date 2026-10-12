@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 控制台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      color: #202522;
+      background: #f4f6f3;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 760px; margin: 0 auto; padding: 28px 20px 48px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    h1 { margin: 0; font-size: 24px; font-weight: 650; }
+    #connection { font-size: 13px; color: #59635d; }
+    .examples { display: flex; flex-wrap: wrap; gap: 8px; margin: 24px 0 16px; }
+    button, input { font: inherit; }
+    .example, #refresh {
+      border: 1px solid #cbd4cd;
+      border-radius: 6px;
+      background: #fff;
+      color: #25352b;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    .example:hover, #refresh:hover { background: #edf3ee; }
+    #messages {
+      min-height: 280px;
+      max-height: 52vh;
+      overflow-y: auto;
+      border-top: 1px solid #d9dfda;
+      border-bottom: 1px solid #d9dfda;
+      padding: 14px 0;
+    }
+    .message { margin: 0 0 14px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message .label { display: block; margin-bottom: 3px; color: #68736b; font-size: 12px; }
+    .message.error { color: #a52c27; }
+    form { display: flex; gap: 8px; margin-top: 14px; }
+    .device-config { display: flex; gap: 8px; margin-top: 20px; }
+    .device-config input { flex: 1; }
+    .device-config button {
+      border: 1px solid #9ca9a0;
+      border-radius: 6px;
+      padding: 0 12px;
+      color: #25352b;
+      background: white;
+      cursor: pointer;
+    }
+    #config-result { min-height: 20px; margin: 6px 0 0; color: #59635d; font-size: 12px; }
+    input {
+      min-width: 0;
+      flex: 1;
+      border: 1px solid #aeb9b1;
+      border-radius: 6px;
+      padding: 11px 12px;
+      background: white;
+    }
+    input:focus { outline: 2px solid #39835b; outline-offset: 1px; }
+    #send {
+      border: 0;
+      border-radius: 6px;
+      padding: 0 18px;
+      color: white;
+      background: #26764a;
+      cursor: pointer;
+    }
+    #send:disabled { opacity: .55; cursor: wait; }
+    .device-state { margin-top: 20px; }
+    .device-state h2 { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+    pre {
+      margin: 0;
+      padding: 12px;
+      min-height: 52px;
+      overflow: auto;
+      border-radius: 6px;
+      background: #e9ede9;
+      font-size: 12px;
+    }
+    @media (max-width: 520px) {
+      main { padding: 20px 14px 32px; }
+      header { align-items: flex-start; flex-direction: column; }
+      #messages { min-height: 230px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>ESP32 控制台</h1>
+      <span id="connection">正在检查设备…</span>
+    </header>
+
+    <div class="examples" aria-label="示例指令">
+      <button class="example" type="button" data-text="把灯调成蓝色">蓝灯</button>
+      <button class="example" type="button" data-text="打开红灯">红灯</button>
+      <button class="example" type="button" data-text="把灯调成绿色">绿灯</button>
+      <button class="example" type="button" data-text="亮绿色和红色，亮度 30%">红绿混色 30%</button>
+      <button class="example" type="button" data-text="把灯亮度调到一半">当前颜色 50%</button>
+      <button class="example" type="button" data-text="关灯">关灯</button>
+    </div>
+
+    <section id="messages" aria-live="polite">
+      <p class="message"><span class="label">系统</span>本地模型已接入。可以正常聊天，也可以控制 RGB 灯的颜色和亮度。</p>
+    </section>
+
+    <form id="chat-form">
+      <input id="command" maxlength="500" autocomplete="off" placeholder="试试：红色和绿色，亮度 30%" required>
+      <button id="send" type="submit">发送</button>
+    </form>
+
+    <section class="device-state">
+      <h2>ESP32 状态</h2>
+      <pre id="state">尚未读取</pre>
+    </section>
+
+    <form id="device-form" class="device-config">
+      <input id="device-url" inputmode="url" placeholder="http://192.168.1.50" aria-label="ESP32 局域网地址">
+      <button type="submit">连接设备</button>
+    </form>
+    <p id="config-result" aria-live="polite"></p>
+  </main>
+
+  <script>
+    const messages = document.querySelector("#messages");
+    const form = document.querySelector("#chat-form");
+    const commandInput = document.querySelector("#command");
+    const sendButton = document.querySelector("#send");
+    const connection = document.querySelector("#connection");
+    const state = document.querySelector("#state");
+    const deviceForm = document.querySelector("#device-form");
+    const deviceUrlInput = document.querySelector("#device-url");
+    const configResult = document.querySelector("#config-result");
+    const sessionKey = "esp32-bridge-session";
+    let sessionId = localStorage.getItem(sessionKey);
+    if (!sessionId) {
+      sessionId = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+      localStorage.setItem(sessionKey, sessionId);
+    }
+
+    function addMessage(label, text, isError = false) {
+      const item = document.createElement("p");
+      item.className = `message${isError ? " error" : ""}`;
+      const heading = document.createElement("span");
+      heading.className = "label";
+      heading.textContent = label;
+      const body = document.createElement("span");
+      body.textContent = text;
+      item.append(heading, body);
+      messages.append(item);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function refreshDevice() {
+      try {
+        const response = await fetch("/api/device");
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "设备未响应");
+        connection.textContent = "ESP32 已连接";
+        state.textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        connection.textContent = "ESP32 未连接";
+        state.textContent = error.message;
+      }
+    }
+
+    deviceForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      configResult.textContent = "正在保存并检查设备…";
+      try {
+        const response = await fetch("/api/device/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ device_url: deviceUrlInput.value.trim() })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "保存失败");
+        configResult.textContent = data.device_url
+          ? `已设置：${data.device_url}`
+          : "已清除设备地址。";
+        await refreshDevice();
+      } catch (error) {
+        configResult.textContent = error.message;
+      }
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const text = commandInput.value.trim();
+      if (!text) return;
+
+      addMessage("你", text);
+      commandInput.value = "";
+      sendButton.disabled = true;
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, session_id: sessionId })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) {
+          addMessage("助手", data.reply || data.error || "请求失败", true);
+        } else {
+          addMessage("助手", data.reply);
+          if (data.device) {
+            state.textContent = JSON.stringify(data.device.state || data.device, null, 2);
+          }
+        }
+      } catch (error) {
+        addMessage("助手", error.message, true);
+      } finally {
+        sendButton.disabled = false;
+        commandInput.focus();
+        refreshDevice();
+      }
+    });
+
+    document.querySelectorAll(".example").forEach((button) => {
+      button.addEventListener("click", () => {
+        commandInput.value = button.dataset.text;
+        form.requestSubmit();
+      });
+    });
+
+    fetch("/api/config")
+      .then((response) => response.json())
+      .then((data) => {
+        deviceUrlInput.value = data.device_url || "";
+        refreshDevice();
+      })
+      .catch(() => {
+        connection.textContent = "网关未连接";
+      });
+  </script>
+</body>
+</html>
