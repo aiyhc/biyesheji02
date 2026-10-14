@@ -1,14 +1,17 @@
+# ESP32 主组件(main)注册文件
+# 告诉构建系统：源文件只有 main.c，头文件搜索路径为当前目录，
+# 并声明依赖的 ESP-IDF 组件（缺任何一个都会在编译时报找不到头文件）。
 idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
     REQUIRES
-        json
-        esp_driver_i2c
-        esp_event
-        esp_http_server
-        esp_lcd
-        esp_netif
-        esp_wifi
-        led_strip
-        nvs_flash
+        json              # cJSON：解析请求、生成响应
+        esp_driver_i2c    # I2C 主机驱动：驱动 OLED
+        esp_event         # 默认事件循环：接收 Wi-Fi / IP 事件
+        esp_http_server   # HTTP 服务器：提供 / 与 /api/* 接口
+        esp_lcd           # LCD 抽象层：SSD1306 面板驱动
+        esp_netif         # 网络接口管理
+        esp_wifi          # Wi-Fi STA 连接
+        led_strip         # 第三方 WS2812 RGB 灯驱动
+        nvs_flash         # 非易失存储（Wi-Fi 驱动内部依赖）
 )

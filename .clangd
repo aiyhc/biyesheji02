@@ -1,2 +1,4 @@
+# clangd 语言服务器配置（仅影响编辑器补全/跳转，不影响编译）
+# 移除 GCC 特有的 -f* / -m* 参数，否则 clangd 解析编译参数会报错、补全失效
 CompileFlags:
     Remove: [-f*, -m*]
