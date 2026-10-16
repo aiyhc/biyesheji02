@@ -22,6 +22,7 @@ import json
 import os
 import queue
 import re
+import ssl
 import threading
 import time
 import urllib.error
@@ -589,6 +590,20 @@ def session_id_is_valid(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", value) is not None
 
 
+def configure_https(server, certfile=None, keyfile=None):
+    """Optionally wrap the gateway socket in TLS for browser microphone access."""
+    if bool(certfile) != bool(keyfile):
+        raise ValueError("HTTPS 需要同时提供证书文件和私钥文件。")
+    if not certfile:
+        return "http"
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    return "https"
+
+
 class GatewayHandler(BaseHTTPRequestHandler):
     """HTTP 请求处理器：对外暴露网页和 /api/* 接口。
 
@@ -941,11 +956,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    """命令行入口：解析参数、初始化共享状态、启动 HTTP 服务。"""
+    """命令行入口：解析参数、初始化共享状态、启动 HTTP(S) 服务。"""
     parser = argparse.ArgumentParser(description="Laptop gateway for ESP32 and local Ollama")
     parser.add_argument("--device-url", default="", help="ESP32 URL, e.g. http://192.168.1.50")
     parser.add_argument("--host", default="127.0.0.1", help="Web bind address")
     parser.add_argument("--port", type=int, default=8080, help="Web port")
+    parser.add_argument("--tls-certfile", help="PEM certificate for HTTPS")
+    parser.add_argument("--tls-keyfile", help="PEM private key for HTTPS")
     parser.add_argument("--ollama-url", default=OLLAMA_URL, help="Local Ollama chat endpoint")
     parser.add_argument("--model", default=OLLAMA_MODEL, help="Installed local Ollama model")
     args = parser.parse_args()
@@ -963,8 +980,14 @@ def main():
     if not args.model.strip():
         parser.error("--model cannot be empty")
 
-    # 共享状态挂在 server 实例上，供各请求线程访问
     server = ThreadingHTTPServer((args.host, args.port), GatewayHandler)
+    try:
+        scheme = configure_https(server, args.tls_certfile, args.tls_keyfile)
+    except (OSError, ssl.SSLError, ValueError) as exc:
+        server.server_close()
+        parser.error(f"HTTPS 配置失败：{exc}")
+
+    # 共享状态挂在 server 实例上，供各请求线程访问
     server.device_url = device_url
     server.ollama_url = args.ollama_url
     server.ollama_model = args.model.strip()
@@ -979,7 +1002,8 @@ def main():
         name="oled-display",
         daemon=True,
     ).start()
-    print(f"网页地址：http://127.0.0.1:{args.port}/")
+    display_host = args.host if args.host not in ("0.0.0.0", "::") else "127.0.0.1"
+    print(f"网页地址：{scheme}://{display_host}:{args.port}/")
     print(f"ESP32 地址：{device_url or '尚未设置，请在网页中填写'}")
     print(f"本地模型：{server.ollama_model} ({server.ollama_url})")
     print("请保持 Ollama 和本机模型运行。按 Ctrl+C 停止网关。")

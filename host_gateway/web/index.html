@@ -88,6 +88,33 @@
       cursor: pointer;
     }
     #send:disabled { opacity: .55; cursor: wait; } /* 请求进行中禁用按钮 */
+    #voice-input {
+      border: 1px solid #9ca9a0;
+      border-radius: 6px;
+      padding: 0 12px;
+      color: #25352b;
+      background: white;
+      cursor: pointer;
+    }
+    #voice-input[aria-pressed="true"] {
+      border-color: #b43b31;
+      color: #8f241d;
+      background: #fff0ee;
+    }
+    #voice-input:disabled { opacity: .55; cursor: not-allowed; }
+    .voice-options {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 32px;
+      margin-top: 6px;
+      color: #59635d;
+      font-size: 12px;
+    }
+    .speech-toggle { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .speech-toggle input { flex: none; width: 16px; height: 16px; margin: 0; accent-color: #26764a; }
+    #voice-status { text-align: right; }
 
     /* ---------- 设备状态展示 ---------- */
     .device-state { margin-top: 20px; }
@@ -136,8 +163,13 @@
     <!-- 聊天输入表单 -->
     <form id="chat-form">
       <input id="command" maxlength="500" autocomplete="off" placeholder="试试：红色和绿色，亮度 30%" required>
+      <button id="voice-input" type="button" aria-pressed="false" title="开始语音识别">语音输入</button>
       <button id="send" type="submit">发送</button>
     </form>
+    <div class="voice-options">
+      <label class="speech-toggle"><input id="speak-replies" type="checkbox" checked>朗读回复</label>
+      <span id="voice-status" role="status" aria-live="polite"></span>
+    </div>
 
     <!-- 设备状态原始 JSON 展示 -->
     <section class="device-state">
@@ -159,11 +191,19 @@
     const form = document.querySelector("#chat-form");
     const commandInput = document.querySelector("#command");
     const sendButton = document.querySelector("#send");
+    const voiceInputButton = document.querySelector("#voice-input");
+    const speakReplies = document.querySelector("#speak-replies");
+    const voiceStatus = document.querySelector("#voice-status");
     const connection = document.querySelector("#connection");
     const state = document.querySelector("#state");
     const deviceForm = document.querySelector("#device-form");
     const deviceUrlInput = document.querySelector("#device-url");
     const configResult = document.querySelector("#config-result");
+    const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recognition = null;
+    let isListening = false;
+    let finalTranscript = "";
+    let recognitionError = "";
 
     // ---------- 会话 ID：存本地，用于服务端串联多轮上下文 ----------
     const sessionKey = "esp32-bridge-session";
@@ -188,6 +228,116 @@
       messages.append(item);
       messages.scrollTop = messages.scrollHeight;
     }
+
+    function setVoiceStatus(text) {
+      voiceStatus.textContent = text;
+    }
+
+    function stopSpeaking() {
+      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    }
+
+    function speakReply(text) {
+      if (!speakReplies.checked || !("speechSynthesis" in window) || !text) return;
+      stopSpeaking();
+      const utterance = new SpeechSynthesisUtterance(text);
+      const voices = window.speechSynthesis.getVoices();
+      const chineseVoice = voices.find((voice) => /^zh[-_]cn$/i.test(voice.lang))
+        || voices.find((voice) => voice.lang.toLowerCase().startsWith("zh"));
+      utterance.lang = chineseVoice ? chineseVoice.lang : "zh-CN";
+      if (chineseVoice) utterance.voice = chineseVoice;
+      utterance.onerror = (event) => {
+        if (event.error !== "canceled" && event.error !== "interrupted") {
+          setVoiceStatus("手机语音播报失败，请检查系统语音设置");
+        }
+      };
+      window.speechSynthesis.speak(utterance);
+    }
+
+    if (!window.isSecureContext) {
+      voiceInputButton.disabled = true;
+      setVoiceStatus("语音输入需要 HTTPS；当前安全连接未启用");
+    } else if (!SpeechRecognitionAPI) {
+      voiceInputButton.disabled = true;
+      setVoiceStatus("此浏览器不支持语音识别，请使用 Android Chrome");
+    } else {
+      setVoiceStatus("语音识别可用");
+    }
+
+    if (!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) {
+      speakReplies.disabled = true;
+      setVoiceStatus("此浏览器不支持语音播报");
+    }
+
+    voiceInputButton.addEventListener("click", () => {
+      if (isListening) {
+        voiceInputButton.textContent = "正在结束…";
+        voiceInputButton.disabled = true;
+        recognition.stop();
+        return;
+      }
+      if (!SpeechRecognitionAPI || !window.isSecureContext) return;
+
+      stopSpeaking();
+      finalTranscript = "";
+      recognitionError = "";
+      recognition = new SpeechRecognitionAPI();
+      recognition.lang = "zh-CN";
+      recognition.interimResults = true;
+      recognition.continuous = false;
+      recognition.maxAlternatives = 1;
+      recognition.onstart = () => {
+        isListening = true;
+        voiceInputButton.disabled = false;
+        voiceInputButton.textContent = "停止聆听";
+        voiceInputButton.setAttribute("aria-pressed", "true");
+        setVoiceStatus("正在聆听…");
+      };
+      recognition.onresult = (event) => {
+        const finalParts = [];
+        const interimParts = [];
+        for (let index = 0; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          (result.isFinal ? finalParts : interimParts).push(result[0].transcript);
+        }
+        finalTranscript = finalParts.join(" ").trim();
+        commandInput.value = [finalTranscript, interimParts.join(" ").trim()]
+          .filter(Boolean).join(" ");
+        setVoiceStatus(finalTranscript ? "已识别，请检查文字后发送" : "正在识别…");
+      };
+      recognition.onerror = (event) => {
+        const messages = {
+          "not-allowed": "麦克风权限被拒绝，请在浏览器设置中允许使用麦克风",
+          "service-not-allowed": "浏览器语音识别服务不可用",
+          "no-speech": "没有检测到语音，请再试一次",
+          "audio-capture": "没有找到可用的麦克风",
+          network: "语音识别服务连接失败，请检查手机网络"
+        };
+        recognitionError = messages[event.error] || `语音识别失败：${event.error}`;
+        setVoiceStatus(recognitionError);
+      };
+      recognition.onend = () => {
+        isListening = false;
+        voiceInputButton.disabled = false;
+        voiceInputButton.textContent = "语音输入";
+        voiceInputButton.setAttribute("aria-pressed", "false");
+        if (finalTranscript) {
+          commandInput.value = finalTranscript;
+          setVoiceStatus("已识别，请检查文字后发送");
+        } else if (!recognitionError) {
+          setVoiceStatus("没有识别到文字，请再试一次");
+        }
+      };
+      try {
+        recognition.start();
+      } catch (error) {
+        setVoiceStatus(`无法启动语音识别：${error.message}`);
+      }
+    });
+
+    speakReplies.addEventListener("change", () => {
+      if (!speakReplies.checked) stopSpeaking();
+    });
 
     /** 查询 ESP32 状态，刷新顶部连接提示与状态区 */
     async function refreshDevice() {
@@ -244,6 +394,7 @@
           addMessage("助手", data.reply || data.error || "请求失败", true);
         } else {
           addMessage("助手", data.reply);
+          speakReply(data.reply);
           // 如果这次请求动了灯，顺便把返回的设备状态显示出来
           if (data.device) {
             state.textContent = JSON.stringify(data.device.state || data.device, null, 2);

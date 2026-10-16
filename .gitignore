@@ -32,6 +32,7 @@ flasher_args.json # Generated in build directory
 sdkconfig.old
 sdkconfig
 main/wifi_secrets.h
+host_gateway/.https/
 
 # ESP-IDF dependencies
 # For older versions or manual component management

@@ -180,5 +180,17 @@ class DeviceUrlTests(unittest.TestCase):
             gateway.validate_device_url("http://8.8.8.8")
 
 
+class HttpsTests(unittest.TestCase):
+    def test_https_is_optional(self):
+        self.assertEqual(gateway.configure_https(object()), "http")
+
+    def test_https_requires_both_certificate_and_key(self):
+        with self.assertRaisesRegex(ValueError, "同时提供"):
+            gateway.configure_https(object(), certfile="gateway.pem")
+
+        with self.assertRaisesRegex(ValueError, "同时提供"):
+            gateway.configure_https(object(), keyfile="gateway-key.pem")
+
+
 if __name__ == "__main__":
     unittest.main()
