@@ -3,14 +3,15 @@
  *
  * 整体链路：
  *   网页输入文字 -> 笔记本网关(host_gateway/gateway.py) -> 本地 Ollama 模型
- *   -> 网关校验并换算成 RGB -> 调用本设备 HTTP 接口 -> GPIO48 RGB 灯 / OLED 屏
+ *   -> 网关校验并调用本设备 HTTP 接口 -> GPIO48 RGB 灯 / GPIO8 雾化器 / OLED
  *
  * 本文件承担的职责：
  *   1. 以 STA 模式连接 Wi-Fi，断线自动重连；
- *   2. 启动 HTTP 服务器，对外提供 4 个接口：
+ *   2. 启动 HTTP 服务器，对外提供 5 个接口：
  *        GET  /             在线探针，返回一行纯文本
- *        GET  /api/status   返回 RGB 灯当前逻辑颜色与 OLED 是否就绪
- *        POST /api/action   执行 set_rgb 动作，点亮 GPIO48 上的 WS2812
+ *        GET  /api/status   返回 RGB 灯、雾化器、步进电机状态与 OLED 是否就绪
+ *        POST /api/action   执行灯光、雾化器或步进电机动作
+ *        POST /api/humidity/config 保存自动控湿参数
  *        POST /api/display  接收 1024 字节 SSD1306 页面格式位图并刷到 OLED
  *   3. 初始化板载 RGB 灯（RMT 驱动）和 SSD1306 OLED（I2C 接口）。
  *
@@ -19,11 +20,15 @@
  */
 
 #include <stdio.h>
+#include <stdbool.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* ESP-IDF 组件头文件：JSON、I2C/OLED、事件循环、HTTP 服务、日志、Wi-Fi 等 */
 #include "cJSON.h"
+#include "dht.h"
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
@@ -32,12 +37,15 @@
 #include "esp_lcd_panel_ssd1306.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "led_strip.h"
 #include "led_strip_rmt.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "wifi_secrets.h" /* 由 wifi_secrets.h.example 复制而来，内含 Wi-Fi 凭据 */
 
@@ -46,6 +54,27 @@
 /* 板载 WS2812 RGB 灯：单颗灯珠接在 GPIO48 */
 #define RGB_LED_GPIO 48
 #define RGB_LED_COUNT 1
+#define HUMIDIFIER_GPIO GPIO_NUM_8
+#define DHT11_GPIO GPIO_NUM_4
+#define DHT11_SAMPLE_INTERVAL_MS 2500
+#define DHT11_FAILURES_BEFORE_INVALID 3
+#define HUMIDITY_ON_BELOW_MIN 20
+#define HUMIDITY_ON_BELOW_MAX 75
+#define HUMIDITY_OFF_AT_MIN 25
+#define HUMIDITY_OFF_AT_MAX 80
+#define HUMIDITY_MIN_THRESHOLD_GAP 3
+#define HUMIDITY_MAX_THRESHOLD_GAP 15
+#define HUMIDITY_DEFAULT_ON_BELOW 45
+#define HUMIDITY_DEFAULT_OFF_AT 50
+#define STEPPER_IN1_GPIO GPIO_NUM_6
+#define STEPPER_IN2_GPIO GPIO_NUM_7
+#define STEPPER_IN3_GPIO GPIO_NUM_15
+#define STEPPER_IN4_GPIO GPIO_NUM_16
+#define STEPPER_MIN_STEPS 1
+#define STEPPER_MAX_STEPS 10000
+#define STEPPER_MIN_INTERVAL_MS 5
+#define STEPPER_MAX_INTERVAL_MS 100
+#define CURTAIN_MAX_TRAVEL_STEPS 100000
 /* 亮度上限：实际写入灯珠的 RGB 分量会被等比例缩放到 0~48，
  * 目的是避免满亮刺眼、同时降低瞬时电流 */
 #define RGB_BRIGHTNESS_LIMIT 48
@@ -82,6 +111,34 @@ static uint8_t s_oled_blank_frame[OLED_FRAME_BYTES]; /* 全黑画面，用于初
 static uint8_t s_rgb_r;
 static uint8_t s_rgb_g;
 static uint8_t s_rgb_b;
+static bool s_humidifier_on;
+static SemaphoreHandle_t s_state_mutex;
+static float s_temperature_c;
+static float s_humidity_pct;
+static bool s_sensor_ok;
+static uint8_t s_sensor_failures;
+static int64_t s_sensor_last_sample_us;
+static bool s_humidity_auto_mode;
+static uint8_t s_humidity_on_below = HUMIDITY_DEFAULT_ON_BELOW;
+static uint8_t s_humidity_off_at = HUMIDITY_DEFAULT_OFF_AT;
+
+typedef struct {
+    bool forward;
+    bool toward_open;
+    uint32_t steps;
+    uint16_t interval_ms;
+} stepper_command_t;
+
+static QueueHandle_t s_stepper_queue;
+static bool s_stepper_busy;
+static bool s_stepper_stop_requested;
+static bool s_stepper_toward_open;
+static uint32_t s_stepper_remaining_steps;
+static bool s_curtain_open_forward = true;
+static int32_t s_curtain_position_steps;
+static uint32_t s_curtain_travel_steps;
+static bool s_curtain_position_valid;
+static uint8_t s_curtain_calibration_stage;
 
 /*
  * 把 cJSON 对象序列化为 JSON 文本并作为响应发出。
@@ -115,14 +172,58 @@ static esp_err_t send_error(httpd_req_t *req, int status, const char *message)
 
     cJSON_AddBoolToObject(root, "ok", false);
     cJSON_AddStringToObject(root, "error", message);
-    /* 只支持 400/404/503/500 四种错误，其余一律按 500 处理 */
+    /* 控制冲突(409)用于拒绝自动模式中的手动开关指令 */
     httpd_resp_set_status(req, status == 400 ? "400 Bad Request" :
+                               status == 409 ? "409 Conflict" :
                                status == 404 ? "404 Not Found" :
                                status == 503 ? "503 Service Unavailable" :
                                "500 Internal Server Error");
     esp_err_t err = send_json(req, root);
     cJSON_Delete(root);
     return err;
+}
+
+static bool read_integer_range(const cJSON *root, const char *key,
+                               int minimum, int maximum, int *value);
+static esp_err_t save_humidity_settings(bool auto_mode, uint8_t on_below,
+                                        uint8_t off_at);
+static cJSON *create_curtain_status(void);
+static esp_err_t save_curtain_state_locked(void);
+
+/* Caller must hold s_state_mutex. */
+static esp_err_t set_humidifier_output_locked(bool on)
+{
+    esp_err_t err = gpio_set_level(HUMIDIFIER_GPIO, on ? 1 : 0);
+    if (err == ESP_OK) {
+        s_humidifier_on = on;
+    }
+    return err;
+}
+
+/* Caller must hold s_state_mutex. A failed sensor read eventually fails safe to off. */
+static void update_humidity_automation_locked(void)
+{
+    if (!s_humidity_auto_mode) {
+        return;
+    }
+
+    bool desired_on = false;
+    if (s_sensor_ok) {
+        if (s_humidity_pct <= (float)s_humidity_on_below) {
+            desired_on = true;
+        } else if (s_humidity_pct >= (float)s_humidity_off_at) {
+            desired_on = false;
+        } else {
+            desired_on = s_humidifier_on;
+        }
+    }
+
+    if (desired_on != s_humidifier_on) {
+        esp_err_t err = set_humidifier_output_locked(desired_on);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Automatic humidifier update failed: %s", esp_err_to_name(err));
+        }
+    }
 }
 
 /*
@@ -136,17 +237,38 @@ static esp_err_t root_handler(httpd_req_t *req)
 }
 
 /*
- * GET /api/status ：返回灯的当前逻辑颜色以及 OLED 是否成功初始化。
+ * GET /api/status ：返回灯的当前逻辑颜色、雾化器状态以及 OLED 是否就绪。
  * 网关在"只调亮度"的场景下会先读这里，拿到当前颜色再重新计算。
  */
 static esp_err_t status_handler(httpd_req_t *req)
 {
+    float temperature_c;
+    float humidity_pct;
+    bool sensor_ok;
+    bool humidifier_on;
+    bool auto_mode;
+    uint8_t on_below_pct;
+    uint8_t off_at_pct;
+    int64_t last_sample_us;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    temperature_c = s_temperature_c;
+    humidity_pct = s_humidity_pct;
+    sensor_ok = s_sensor_ok;
+    humidifier_on = s_humidifier_on;
+    auto_mode = s_humidity_auto_mode;
+    on_below_pct = s_humidity_on_below;
+    off_at_pct = s_humidity_off_at;
+    last_sample_us = s_sensor_last_sample_us;
+    xSemaphoreGive(s_state_mutex);
+
     cJSON *root = cJSON_CreateObject();
     cJSON *rgb = cJSON_CreateObject();
-    if (root == NULL || rgb == NULL) {
+    cJSON *curtain = create_curtain_status();
+    if (root == NULL || rgb == NULL || curtain == NULL) {
         /* 两个对象都要检查，任一失败就不能继续 */
         cJSON_Delete(root);
         cJSON_Delete(rgb);
+        cJSON_Delete(curtain);
         return send_error(req, 500, "JSON allocation failed");
     }
 
@@ -156,6 +278,16 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(rgb, "g", s_rgb_g);
     cJSON_AddNumberToObject(rgb, "b", s_rgb_b);
     cJSON_AddItemToObject(root, "rgb", rgb);
+    cJSON_AddBoolToObject(root, "humidifier_on", humidifier_on);
+    cJSON_AddBoolToObject(root, "sensor_ok", sensor_ok);
+    cJSON_AddNumberToObject(root, "temperature_c", temperature_c);
+    cJSON_AddNumberToObject(root, "humidity_pct", humidity_pct);
+    cJSON_AddNumberToObject(root, "sensor_age_ms",
+                            last_sample_us > 0 ? (esp_timer_get_time() - last_sample_us) / 1000 : -1);
+    cJSON_AddBoolToObject(root, "auto_mode", auto_mode);
+    cJSON_AddNumberToObject(root, "on_below_pct", on_below_pct);
+    cJSON_AddNumberToObject(root, "off_at_pct", off_at_pct);
+    cJSON_AddItemToObject(root, "curtain", curtain);
     /* OLED 未探测到时为 false，网关侧不会向不可用的屏推图 */
     cJSON_AddBoolToObject(root, "oled_ready", s_oled_panel != NULL);
 
@@ -164,34 +296,205 @@ static esp_err_t status_handler(httpd_req_t *req)
     return err;
 }
 
+static esp_err_t humidity_config_handler(httpd_req_t *req)
+{
+    if (req->content_len <= 0 || req->content_len > MAX_ACTION_BODY) {
+        return send_error(req, 400, "Invalid request size");
+    }
+
+    char body[MAX_ACTION_BODY + 1];
+    size_t received = 0;
+    while (received < (size_t)req->content_len) {
+        int count = httpd_req_recv(req, body + received, req->content_len - received);
+        if (count <= 0) return ESP_FAIL;
+        received += (size_t)count;
+    }
+    body[received] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    if (root == NULL) return send_error(req, 400, "Invalid JSON");
+
+    const cJSON *auto_item = cJSON_GetObjectItemCaseSensitive(root, "auto_mode");
+    int on_below_pct;
+    int off_at_pct;
+    if (!cJSON_IsBool(auto_item) ||
+        !read_integer_range(root, "on_below_pct", HUMIDITY_ON_BELOW_MIN,
+                            HUMIDITY_ON_BELOW_MAX, &on_below_pct) ||
+        !read_integer_range(root, "off_at_pct", HUMIDITY_OFF_AT_MIN,
+                            HUMIDITY_OFF_AT_MAX, &off_at_pct) ||
+        off_at_pct - on_below_pct < HUMIDITY_MIN_THRESHOLD_GAP ||
+        off_at_pct - on_below_pct > HUMIDITY_MAX_THRESHOLD_GAP) {
+        cJSON_Delete(root);
+        return send_error(req, 400, "Invalid humidity automation settings");
+    }
+
+    bool auto_mode = cJSON_IsTrue(auto_item);
+    esp_err_t err = save_humidity_settings(auto_mode, (uint8_t)on_below_pct,
+                                           (uint8_t)off_at_pct);
+    if (err != ESP_OK) {
+        cJSON_Delete(root);
+        ESP_LOGE(TAG, "Saving humidity settings failed: %s", esp_err_to_name(err));
+        return send_error(req, 500, "Could not save humidity settings");
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_humidity_auto_mode = auto_mode;
+    s_humidity_on_below = (uint8_t)on_below_pct;
+    s_humidity_off_at = (uint8_t)off_at_pct;
+    if (auto_mode) {
+        update_humidity_automation_locked();
+    } else if (s_humidifier_on) {
+        err = set_humidifier_output_locked(false);
+    }
+    bool humidifier_on = s_humidifier_on;
+    xSemaphoreGive(s_state_mutex);
+    cJSON_Delete(root);
+    if (err != ESP_OK) return send_error(req, 500, "Could not update humidifier output");
+
+    cJSON *response = cJSON_CreateObject();
+    if (response == NULL) return send_error(req, 500, "JSON allocation failed");
+    cJSON_AddBoolToObject(response, "ok", true);
+    cJSON_AddBoolToObject(response, "auto_mode", auto_mode);
+    cJSON_AddNumberToObject(response, "on_below_pct", on_below_pct);
+    cJSON_AddNumberToObject(response, "off_at_pct", off_at_pct);
+    cJSON_AddBoolToObject(response, "humidifier_on", humidifier_on);
+    err = send_json(req, response);
+    cJSON_Delete(response);
+    return err;
+}
+
 /*
  * 从 JSON 对象里读取一个 0~255 的整数颜色分量。
  * 要求：字段存在、是数字、必须为整数（拒绝 3.5 这类小数）、且在 0~255 之间。
  * 校验通过后写入 *value 并返回 true。
  */
-static bool read_rgb_value(const cJSON *root, const char *key, int *value)
+static bool read_integer_range(const cJSON *root, const char *key, int minimum, int maximum, int *value)
 {
     const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
-    if (!cJSON_IsNumber(item) || item->valuedouble < 0.0 ||
-        item->valuedouble > 255.0 || item->valuedouble != (double)item->valueint) {
+    if (!cJSON_IsNumber(item) || item->valuedouble < minimum ||
+        item->valuedouble > maximum || item->valuedouble != (double)item->valueint) {
         return false;
     }
     *value = item->valueint;
     return true;
 }
 
+static bool read_rgb_value(const cJSON *root, const char *key, int *value)
+{
+    return read_integer_range(root, key, 0, 255, value);
+}
+
+static cJSON *create_curtain_status(void)
+{
+    bool busy;
+    bool stop_requested;
+    bool open_forward;
+    bool toward_open;
+    bool position_valid;
+    int32_t position_steps;
+    uint32_t travel_steps;
+    uint32_t remaining_steps;
+    uint8_t calibration_stage;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    busy = s_stepper_busy;
+    stop_requested = s_stepper_stop_requested;
+    open_forward = s_curtain_open_forward;
+    toward_open = s_stepper_toward_open;
+    position_valid = s_curtain_position_valid;
+    position_steps = s_curtain_position_steps;
+    travel_steps = s_curtain_travel_steps;
+    remaining_steps = s_stepper_remaining_steps;
+    calibration_stage = s_curtain_calibration_stage;
+    xSemaphoreGive(s_state_mutex);
+
+    cJSON *curtain = cJSON_CreateObject();
+    if (curtain == NULL) return NULL;
+    int position_pct = -1;
+    if (travel_steps > 0 && position_steps >= 0) {
+        position_pct = (int)(((uint64_t)position_steps * 100 + travel_steps / 2) /
+                             travel_steps);
+        if (position_pct > 100) position_pct = 100;
+    }
+    cJSON_AddBoolToObject(curtain, "busy", busy);
+    cJSON_AddBoolToObject(curtain, "stop_requested", stop_requested);
+    cJSON_AddBoolToObject(curtain, "moving_toward_open", toward_open);
+    cJSON_AddBoolToObject(curtain, "calibrated", calibration_stage == 0 && travel_steps > 0);
+    cJSON_AddBoolToObject(curtain, "position_valid", position_valid);
+    cJSON_AddStringToObject(curtain, "open_direction", open_forward ? "forward" : "reverse");
+    cJSON_AddNumberToObject(curtain, "position_steps", position_steps);
+    cJSON_AddNumberToObject(curtain, "travel_steps", travel_steps);
+    cJSON_AddNumberToObject(curtain, "position_pct", position_pct);
+    cJSON_AddNumberToObject(curtain, "remaining_steps", remaining_steps);
+    cJSON_AddNumberToObject(curtain, "calibration_stage", calibration_stage);
+    return curtain;
+}
+
+static esp_err_t send_curtain_state_response(httpd_req_t *req, const cJSON *request_root)
+{
+    cJSON *response = cJSON_CreateObject();
+    cJSON *state = cJSON_CreateObject();
+    cJSON *curtain = create_curtain_status();
+    if (response == NULL || state == NULL || curtain == NULL) {
+        cJSON_Delete(response);
+        cJSON_Delete(state);
+        cJSON_Delete(curtain);
+        return send_error(req, 500, "JSON allocation failed");
+    }
+    cJSON_AddBoolToObject(response, "ok", true);
+    const cJSON *request_id = cJSON_GetObjectItemCaseSensitive(request_root, "request_id");
+    if (cJSON_IsString(request_id)) {
+        cJSON_AddStringToObject(response, "request_id", request_id->valuestring);
+    }
+    cJSON_AddItemToObject(state, "curtain", curtain);
+    cJSON_AddItemToObject(response, "state", state);
+    esp_err_t err = send_json(req, response);
+    cJSON_Delete(response);
+    return err;
+}
+
+/* Caller holds s_state_mutex. */
+static esp_err_t queue_curtain_command_locked(const stepper_command_t *command,
+                                             bool calibration_jog)
+{
+    if (s_stepper_busy) return ESP_ERR_INVALID_STATE;
+    if (calibration_jog) {
+        if (s_curtain_calibration_stage != 1) return ESP_ERR_INVALID_STATE;
+    } else {
+        if (!s_curtain_position_valid) return ESP_ERR_INVALID_STATE;
+        s_curtain_position_valid = false;
+        esp_err_t save_err = save_curtain_state_locked();
+        if (save_err != ESP_OK) {
+            s_curtain_position_valid = true;
+            return save_err;
+        }
+    }
+
+    s_stepper_busy = true;
+    s_stepper_stop_requested = false;
+    s_stepper_toward_open = command->toward_open;
+    s_stepper_remaining_steps = command->steps;
+    if (s_stepper_queue == NULL || xQueueSend(s_stepper_queue, command, 0) != pdTRUE) {
+        s_stepper_busy = false;
+        s_stepper_remaining_steps = 0;
+        if (!calibration_jog) {
+            s_curtain_position_valid = true;
+            save_curtain_state_locked();
+        }
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 /*
- * POST /api/action ：灯光控制的唯一写接口。
+ * POST /api/action ：执行 RGB 灯、雾化器或窗帘动作。
  *
  * 请求体示例：
  *   {"request_id":"demo-1","action":"set_rgb","r":0,"g":0,"b":255}
  *
  * 处理步骤：
- *   1. 校验请求体长度合法，并完整读取到栈上缓冲区；
- *   2. 解析 JSON，只接受 action == "set_rgb"；
- *   3. 校验 r/g/b 都是 0~255 的整数；
- *   4. 按 RGB_BRIGHTNESS_LIMIT 等比例缩放后写入灯珠并刷新；
- *   5. 记录逻辑颜色，返回 {"ok":true,"state":{"rgb":{...}}}，并回显 request_id。
+ *   action=set_rgb: 校验 RGB、限幅并更新 WS2812；
+ *   action=set_humidifier: 校验布尔值并驱动 GPIO8 高/低电平；
+ *   窗帘动作: 校验校准状态、步数和目标百分比后排入电机任务。
  */
 static esp_err_t action_handler(httpd_req_t *req)
 {
@@ -217,9 +520,240 @@ static esp_err_t action_handler(httpd_req_t *req)
         return send_error(req, 400, "Invalid JSON");
     }
 
-    /* 目前只实现 set_rgb 一个动作 */
     const cJSON *action = cJSON_GetObjectItemCaseSensitive(root, "action");
-    if (!cJSON_IsString(action) || strcmp(action->valuestring, "set_rgb") != 0) {
+    if (!cJSON_IsString(action)) {
+        cJSON_Delete(root);
+        return send_error(req, 400, "Unsupported action");
+    }
+
+    if (strcmp(action->valuestring, "set_humidifier") == 0) {
+        const cJSON *on_item = cJSON_GetObjectItemCaseSensitive(root, "on");
+        if (!cJSON_IsBool(on_item)) {
+            cJSON_Delete(root);
+            return send_error(req, 400, "Humidifier on must be a boolean");
+        }
+
+        bool requested_on = cJSON_IsTrue(on_item);
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (s_humidity_auto_mode) {
+            xSemaphoreGive(s_state_mutex);
+            cJSON_Delete(root);
+            return send_error(req, 409, "Automatic humidity control is active");
+        }
+        esp_err_t err = set_humidifier_output_locked(requested_on);
+        xSemaphoreGive(s_state_mutex);
+        if (err != ESP_OK) {
+            cJSON_Delete(root);
+            ESP_LOGE(TAG, "Humidifier GPIO update failed: %s", esp_err_to_name(err));
+            return send_error(req, 500, "Humidifier GPIO update failed");
+        }
+
+        cJSON *response = cJSON_CreateObject();
+        cJSON *state = cJSON_CreateObject();
+        if (response == NULL || state == NULL) {
+            cJSON_Delete(root);
+            cJSON_Delete(response);
+            cJSON_Delete(state);
+            return send_error(req, 500, "JSON allocation failed");
+        }
+        cJSON_AddBoolToObject(response, "ok", true);
+        const cJSON *request_id = cJSON_GetObjectItemCaseSensitive(root, "request_id");
+        if (cJSON_IsString(request_id)) {
+            cJSON_AddStringToObject(response, "request_id", request_id->valuestring);
+        }
+        cJSON_AddBoolToObject(state, "humidifier_on", s_humidifier_on);
+        cJSON_AddItemToObject(response, "state", state);
+
+        err = send_json(req, response);
+        cJSON_Delete(root);
+        cJSON_Delete(response);
+        return err;
+    }
+
+    if (strcmp(action->valuestring, "stepper_stop") == 0) {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (s_stepper_busy) s_stepper_stop_requested = true;
+        xSemaphoreGive(s_state_mutex);
+        esp_err_t err = send_curtain_state_response(req, root);
+        cJSON_Delete(root);
+        return err;
+    }
+
+    if (strcmp(action->valuestring, "curtain_set_closed") == 0) {
+        const cJSON *direction = cJSON_GetObjectItemCaseSensitive(root, "open_direction");
+        if (!cJSON_IsString(direction) ||
+            (strcmp(direction->valuestring, "forward") != 0 &&
+             strcmp(direction->valuestring, "reverse") != 0)) {
+            cJSON_Delete(root);
+            return send_error(req, 400, "Open direction must be forward or reverse");
+        }
+
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (s_stepper_busy) {
+            xSemaphoreGive(s_state_mutex);
+            cJSON_Delete(root);
+            return send_error(req, 409, "Wait for the curtain motor to stop first");
+        }
+        bool old_open_forward = s_curtain_open_forward;
+        int32_t old_position = s_curtain_position_steps;
+        uint32_t old_travel = s_curtain_travel_steps;
+        bool old_valid = s_curtain_position_valid;
+        uint8_t old_stage = s_curtain_calibration_stage;
+        s_curtain_open_forward = strcmp(direction->valuestring, "forward") == 0;
+        s_curtain_position_steps = 0;
+        s_curtain_travel_steps = 0;
+        s_curtain_position_valid = false;
+        s_curtain_calibration_stage = 1;
+        esp_err_t err = save_curtain_state_locked();
+        if (err != ESP_OK) {
+            s_curtain_open_forward = old_open_forward;
+            s_curtain_position_steps = old_position;
+            s_curtain_travel_steps = old_travel;
+            s_curtain_position_valid = old_valid;
+            s_curtain_calibration_stage = old_stage;
+        }
+        xSemaphoreGive(s_state_mutex);
+        if (err != ESP_OK) {
+            cJSON_Delete(root);
+            return send_error(req, 500, "Could not save curtain calibration");
+        }
+        err = send_curtain_state_response(req, root);
+        cJSON_Delete(root);
+        return err;
+    }
+
+    if (strcmp(action->valuestring, "curtain_set_open") == 0) {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (s_stepper_busy) {
+            xSemaphoreGive(s_state_mutex);
+            cJSON_Delete(root);
+            return send_error(req, 409, "Wait for the curtain motor to stop first");
+        }
+        if (s_curtain_calibration_stage != 1 || s_curtain_position_steps <= 0 ||
+            s_curtain_position_steps > CURTAIN_MAX_TRAVEL_STEPS) {
+            xSemaphoreGive(s_state_mutex);
+            cJSON_Delete(root);
+            return send_error(req, 409, "Jog the curtain open from the closed endpoint first");
+        }
+        int32_t old_position = s_curtain_position_steps;
+        uint32_t old_travel = s_curtain_travel_steps;
+        bool old_valid = s_curtain_position_valid;
+        uint8_t old_stage = s_curtain_calibration_stage;
+        s_curtain_travel_steps = (uint32_t)s_curtain_position_steps;
+        s_curtain_position_valid = true;
+        s_curtain_calibration_stage = 0;
+        esp_err_t err = save_curtain_state_locked();
+        if (err != ESP_OK) {
+            s_curtain_position_steps = old_position;
+            s_curtain_travel_steps = old_travel;
+            s_curtain_position_valid = old_valid;
+            s_curtain_calibration_stage = old_stage;
+        }
+        xSemaphoreGive(s_state_mutex);
+        if (err != ESP_OK) {
+            cJSON_Delete(root);
+            return send_error(req, 500, "Could not save curtain calibration");
+        }
+        err = send_curtain_state_response(req, root);
+        cJSON_Delete(root);
+        return err;
+    }
+
+    if (strcmp(action->valuestring, "curtain_set_position") == 0) {
+        int position_pct;
+        int interval_ms;
+        if (!read_integer_range(root, "position_pct", 0, 100, &position_pct) ||
+            !read_integer_range(root, "interval_ms", STEPPER_MIN_INTERVAL_MS,
+                                STEPPER_MAX_INTERVAL_MS, &interval_ms)) {
+            cJSON_Delete(root);
+            return send_error(req, 400, "Curtain position or speed is invalid");
+        }
+
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (s_stepper_busy) {
+            xSemaphoreGive(s_state_mutex);
+            cJSON_Delete(root);
+            return send_error(req, 409, "Curtain motor is already moving");
+        }
+        if (!s_curtain_position_valid || s_curtain_travel_steps == 0) {
+            xSemaphoreGive(s_state_mutex);
+            cJSON_Delete(root);
+            return send_error(req, 409, "Calibrate the curtain travel before position control");
+        }
+        uint32_t target_steps = (uint32_t)(((uint64_t)s_curtain_travel_steps *
+                                            (uint32_t)position_pct + 50) / 100);
+        if (target_steps == (uint32_t)s_curtain_position_steps) {
+            xSemaphoreGive(s_state_mutex);
+            esp_err_t err = send_curtain_state_response(req, root);
+            cJSON_Delete(root);
+            return err;
+        }
+        bool toward_open = target_steps > (uint32_t)s_curtain_position_steps;
+        stepper_command_t command = {
+            .forward = toward_open ? s_curtain_open_forward : !s_curtain_open_forward,
+            .toward_open = toward_open,
+            .steps = toward_open ? target_steps - (uint32_t)s_curtain_position_steps
+                                 : (uint32_t)s_curtain_position_steps - target_steps,
+            .interval_ms = (uint16_t)interval_ms,
+        };
+        esp_err_t err = queue_curtain_command_locked(&command, false);
+        xSemaphoreGive(s_state_mutex);
+        if (err != ESP_OK) {
+            cJSON_Delete(root);
+            return send_error(req, err == ESP_FAIL ? 503 : 500,
+                              "Could not start curtain movement");
+        }
+        err = send_curtain_state_response(req, root);
+        cJSON_Delete(root);
+        return err;
+    }
+
+    if (strcmp(action->valuestring, "curtain_jog") == 0) {
+        const cJSON *direction = cJSON_GetObjectItemCaseSensitive(root, "direction");
+        int steps;
+        int interval_ms;
+        if (!cJSON_IsString(direction) ||
+            (strcmp(direction->valuestring, "open") != 0 &&
+             strcmp(direction->valuestring, "close") != 0) ||
+            !read_integer_range(root, "steps", STEPPER_MIN_STEPS,
+                                STEPPER_MAX_STEPS, &steps) ||
+            !read_integer_range(root, "interval_ms", STEPPER_MIN_INTERVAL_MS,
+                                STEPPER_MAX_INTERVAL_MS, &interval_ms)) {
+            cJSON_Delete(root);
+            return send_error(req, 400, "Invalid curtain jog direction, steps, or interval");
+        }
+
+        bool toward_open = strcmp(direction->valuestring, "open") == 0;
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (s_stepper_busy) {
+            xSemaphoreGive(s_state_mutex);
+            cJSON_Delete(root);
+            return send_error(req, 409, "Curtain motor is already moving");
+        }
+        if (s_curtain_calibration_stage != 1) {
+            xSemaphoreGive(s_state_mutex);
+            cJSON_Delete(root);
+            return send_error(req, 409, "Mark the closed endpoint before calibration jogging");
+        }
+        stepper_command_t command = {
+            .forward = toward_open ? s_curtain_open_forward : !s_curtain_open_forward,
+            .toward_open = toward_open,
+            .steps = (uint32_t)steps,
+            .interval_ms = (uint16_t)interval_ms,
+        };
+        esp_err_t err = queue_curtain_command_locked(&command, true);
+        xSemaphoreGive(s_state_mutex);
+        if (err != ESP_OK) {
+            cJSON_Delete(root);
+            return send_error(req, err == ESP_FAIL ? 503 : 409,
+                              "Could not start curtain calibration jog");
+        }
+        err = send_curtain_state_response(req, root);
+        cJSON_Delete(root);
+        return err;
+    }
+
+    if (strcmp(action->valuestring, "set_rgb") != 0) {
         cJSON_Delete(root);
         return send_error(req, 400, "Unsupported action");
     }
@@ -339,18 +873,18 @@ static esp_err_t display_handler(httpd_req_t *req)
 
 /*
  * 启动 HTTP 服务器并注册全部路由。
- * max_uri_handlers 需要 >= 实际注册的路由数（这里是 4 个，留了 1 个余量）。
+ * max_uri_handlers 需要 >= 实际注册的路由数（这里是 5 个，留了 1 个余量）。
  */
 static esp_err_t start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 5;
+    config.max_uri_handlers = 6;
     esp_err_t err = httpd_start(&s_http_server, &config);
     if (err != ESP_OK) {
         return err;
     }
 
-    /* 四个路由：探针、状态查询、灯光控制、OLED 刷图 */
+    /* 五个路由：探针、状态、设备动作、控湿设置、OLED 刷图 */
     const httpd_uri_t root_uri = {
         .uri = "/",
         .method = HTTP_GET,
@@ -366,6 +900,11 @@ static esp_err_t start_http_server(void)
         .method = HTTP_POST,
         .handler = action_handler,
     };
+    const httpd_uri_t humidity_config_uri = {
+        .uri = "/api/humidity/config",
+        .method = HTTP_POST,
+        .handler = humidity_config_handler,
+    };
     const httpd_uri_t display_uri = {
         .uri = "/api/display",
         .method = HTTP_POST,
@@ -375,6 +914,7 @@ static esp_err_t start_http_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &root_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &action_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &humidity_config_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &display_uri));
     ESP_LOGI(TAG, "HTTP control server started on port 80");
     return ESP_OK;
@@ -469,6 +1009,274 @@ static void init_rgb_led(void)
 
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &s_rgb_strip));
     ESP_ERROR_CHECK(led_strip_clear(s_rgb_strip)); /* 上电先熄灭，避免乱闪 */
+}
+
+static void init_humidifier(void)
+{
+    const gpio_config_t config = {
+        .pin_bit_mask = 1ULL << HUMIDIFIER_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&config));
+    ESP_ERROR_CHECK(gpio_set_level(HUMIDIFIER_GPIO, 0));
+    s_humidifier_on = false;
+    ESP_LOGI(TAG, "Humidifier output ready on GPIO%d (active high, initially off)", HUMIDIFIER_GPIO);
+}
+
+/* Caller holds s_state_mutex. */
+static esp_err_t save_curtain_state_locked(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("curtain", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+
+    uint32_t position = s_curtain_position_valid && s_curtain_position_steps >= 0
+                            ? (uint32_t)s_curtain_position_steps : 0;
+    err = nvs_set_u32(handle, "position", position);
+    if (err == ESP_OK) err = nvs_set_u32(handle, "travel", s_curtain_travel_steps);
+    if (err == ESP_OK) err = nvs_set_u8(handle, "valid", s_curtain_position_valid ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(handle, "open_fwd", s_curtain_open_forward ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(handle, "cal_stage", s_curtain_calibration_stage);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+static void load_curtain_state(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open("curtain", NVS_READONLY, &handle) != ESP_OK) return;
+
+    uint32_t position = 0;
+    uint32_t travel = 0;
+    uint8_t valid = 0;
+    uint8_t open_forward = 1;
+    uint8_t calibration_stage = 0;
+    nvs_get_u32(handle, "position", &position);
+    nvs_get_u32(handle, "travel", &travel);
+    nvs_get_u8(handle, "valid", &valid);
+    nvs_get_u8(handle, "open_fwd", &open_forward);
+    nvs_get_u8(handle, "cal_stage", &calibration_stage);
+    nvs_close(handle);
+
+    if (open_forward > 1) open_forward = 1;
+    s_curtain_open_forward = open_forward == 1;
+    if (calibration_stage != 0 || valid != 1 || travel == 0 ||
+        travel > CURTAIN_MAX_TRAVEL_STEPS || position > travel) {
+        s_curtain_position_steps = 0;
+        s_curtain_travel_steps = calibration_stage == 0 && travel <= CURTAIN_MAX_TRAVEL_STEPS
+                                     ? travel : 0;
+        s_curtain_position_valid = false;
+        s_curtain_calibration_stage = 0;
+    } else {
+        s_curtain_position_steps = (int32_t)position;
+        s_curtain_travel_steps = travel;
+        s_curtain_position_valid = true;
+        s_curtain_calibration_stage = 0;
+    }
+    ESP_LOGI(TAG, "Curtain state: %s, position=%ld/%lu steps, open=%s",
+             s_curtain_position_valid ? "valid" : "needs calibration",
+             (long)s_curtain_position_steps, (unsigned long)s_curtain_travel_steps,
+             s_curtain_open_forward ? "forward" : "reverse");
+}
+
+static void stepper_task(void *arg)
+{
+    (void)arg;
+    static const uint8_t phase_masks[8] = {
+        0x01, 0x03, 0x02, 0x06, 0x04, 0x0C, 0x08, 0x09,
+    };
+    const gpio_num_t pins[4] = {
+        STEPPER_IN1_GPIO, STEPPER_IN2_GPIO, STEPPER_IN3_GPIO, STEPPER_IN4_GPIO,
+    };
+    uint8_t phase = 7;
+    stepper_command_t command;
+
+    while (true) {
+        if (xQueueReceive(s_stepper_queue, &command, portMAX_DELAY) != pdTRUE) continue;
+
+        bool gpio_failed = false;
+        for (uint32_t index = 0; index < command.steps; ++index) {
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            bool stop = s_stepper_stop_requested;
+            xSemaphoreGive(s_state_mutex);
+            if (stop) break;
+
+            phase = (uint8_t)((phase + (command.forward ? 1 : 7)) % 8);
+            uint8_t mask = phase_masks[phase];
+            esp_err_t err = ESP_OK;
+            for (int pin = 0; pin < 4 && err == ESP_OK; ++pin) {
+                err = gpio_set_level(pins[pin], (mask >> pin) & 1U);
+            }
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Stepper GPIO update failed: %s", esp_err_to_name(err));
+                gpio_failed = true;
+                break;
+            }
+
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            s_stepper_remaining_steps = command.steps - index - 1;
+            if (s_curtain_calibration_stage == 1) {
+                int32_t delta = command.toward_open ? 1 : -1;
+                int64_t next_position = (int64_t)s_curtain_position_steps + delta;
+                if (next_position > CURTAIN_MAX_TRAVEL_STEPS ||
+                    next_position < -(int64_t)CURTAIN_MAX_TRAVEL_STEPS) {
+                    gpio_failed = true;
+                    s_stepper_stop_requested = true;
+                } else {
+                    s_curtain_position_steps = (int32_t)next_position;
+                }
+            } else if (s_curtain_travel_steps > 0) {
+                if (command.toward_open &&
+                    (uint32_t)s_curtain_position_steps < s_curtain_travel_steps) {
+                    s_curtain_position_steps++;
+                } else if (!command.toward_open && s_curtain_position_steps > 0) {
+                    s_curtain_position_steps--;
+                }
+            }
+            xSemaphoreGive(s_state_mutex);
+            if (gpio_failed) break;
+            vTaskDelay(pdMS_TO_TICKS(command.interval_ms));
+        }
+
+        for (int pin = 0; pin < 4; ++pin) gpio_set_level(pins[pin], 0);
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        s_stepper_busy = false;
+        s_stepper_stop_requested = false;
+        s_stepper_remaining_steps = 0;
+        if (s_curtain_calibration_stage == 0 && s_curtain_travel_steps > 0) {
+            s_curtain_position_valid = !gpio_failed;
+            esp_err_t save_err = save_curtain_state_locked();
+            if (save_err != ESP_OK) {
+                s_curtain_position_valid = false;
+                ESP_LOGE(TAG, "Saving curtain position failed: %s", esp_err_to_name(save_err));
+            }
+        }
+        xSemaphoreGive(s_state_mutex);
+    }
+}
+
+static void init_stepper(void)
+{
+    const uint64_t pin_mask = (1ULL << STEPPER_IN1_GPIO) |
+                              (1ULL << STEPPER_IN2_GPIO) |
+                              (1ULL << STEPPER_IN3_GPIO) |
+                              (1ULL << STEPPER_IN4_GPIO);
+    const gpio_config_t config = {
+        .pin_bit_mask = pin_mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&config));
+    ESP_ERROR_CHECK(gpio_set_level(STEPPER_IN1_GPIO, 0));
+    ESP_ERROR_CHECK(gpio_set_level(STEPPER_IN2_GPIO, 0));
+    ESP_ERROR_CHECK(gpio_set_level(STEPPER_IN3_GPIO, 0));
+    ESP_ERROR_CHECK(gpio_set_level(STEPPER_IN4_GPIO, 0));
+    load_curtain_state();
+
+    s_stepper_queue = xQueueCreate(1, sizeof(stepper_command_t));
+    ESP_ERROR_CHECK(s_stepper_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    ESP_ERROR_CHECK(xTaskCreate(stepper_task, "stepper", 3072, NULL, 5, NULL) == pdPASS
+                        ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_LOGI(TAG, "ULN2003 stepper ready: IN1=%d IN2=%d IN3=%d IN4=%d",
+             STEPPER_IN1_GPIO, STEPPER_IN2_GPIO, STEPPER_IN3_GPIO, STEPPER_IN4_GPIO);
+}
+
+static void load_humidity_settings(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open("humidity", NVS_READONLY, &handle) != ESP_OK) {
+        return;
+    }
+
+    uint8_t auto_mode = 0;
+    uint8_t on_below = HUMIDITY_DEFAULT_ON_BELOW;
+    uint8_t off_at = HUMIDITY_DEFAULT_OFF_AT;
+    nvs_get_u8(handle, "auto", &auto_mode);
+    nvs_get_u8(handle, "on_below", &on_below);
+    nvs_get_u8(handle, "off_at", &off_at);
+    nvs_close(handle);
+
+    if (auto_mode > 1) auto_mode = 0;
+    if (on_below < HUMIDITY_ON_BELOW_MIN || on_below > HUMIDITY_ON_BELOW_MAX ||
+        off_at < HUMIDITY_OFF_AT_MIN || off_at > HUMIDITY_OFF_AT_MAX ||
+        off_at - on_below < HUMIDITY_MIN_THRESHOLD_GAP ||
+        off_at - on_below > HUMIDITY_MAX_THRESHOLD_GAP) {
+        on_below = HUMIDITY_DEFAULT_ON_BELOW;
+        off_at = HUMIDITY_DEFAULT_OFF_AT;
+    }
+
+    s_humidity_auto_mode = auto_mode == 1;
+    s_humidity_on_below = on_below;
+    s_humidity_off_at = off_at;
+}
+
+static esp_err_t save_humidity_settings(bool auto_mode, uint8_t on_below, uint8_t off_at)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("humidity", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_u8(handle, "auto", auto_mode ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(handle, "on_below", on_below);
+    if (err == ESP_OK) err = nvs_set_u8(handle, "off_at", off_at);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+static void dht11_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        float humidity = 0.0f;
+        float temperature = 0.0f;
+        esp_err_t err = dht_read_float_data(DHT_TYPE_DHT11, DHT11_GPIO, &humidity, &temperature);
+        bool valid = err == ESP_OK && isfinite(humidity) && isfinite(temperature) &&
+                     humidity >= 0.0f && humidity <= 100.0f &&
+                     temperature >= -40.0f && temperature <= 80.0f;
+
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (valid) {
+            s_humidity_pct = humidity;
+            s_temperature_c = temperature;
+            s_sensor_last_sample_us = esp_timer_get_time();
+            s_sensor_failures = 0;
+            s_sensor_ok = true;
+        } else {
+            if (s_sensor_failures < UINT8_MAX) s_sensor_failures++;
+            if (s_sensor_failures >= DHT11_FAILURES_BEFORE_INVALID) {
+                s_sensor_ok = false;
+            }
+        }
+        update_humidity_automation_locked();
+        xSemaphoreGive(s_state_mutex);
+
+        if (!valid) {
+            ESP_LOGW(TAG, "DHT11 read failed (%s)", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "DHT11 temperature=%.1f C humidity=%.1f%%",
+                     temperature, humidity);
+        }
+        vTaskDelay(pdMS_TO_TICKS(DHT11_SAMPLE_INTERVAL_MS));
+    }
+}
+
+static void init_humidity_control(void)
+{
+    s_state_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_state_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    load_humidity_settings();
+    ESP_LOGI(TAG, "Humidity automation: %s, on below %u%% off at %u%%",
+             s_humidity_auto_mode ? "enabled" : "disabled",
+             s_humidity_on_below, s_humidity_off_at);
+    ESP_ERROR_CHECK(xTaskCreate(dht11_task, "dht11", 4096, NULL, 5, NULL) == pdPASS
+                        ? ESP_OK : ESP_ERR_NO_MEM);
 }
 
 /*
@@ -579,12 +1387,15 @@ static void init_nvs(void)
 
 /*
  * 固件入口。
- * 顺序：NVS -> RGB 灯 -> OLED -> Wi-Fi；
+ * 顺序：雾化器安全关闭 -> NVS -> RGB 灯 -> OLED -> Wi-Fi；
  * 阻塞等待拿到 IP 后才启动 HTTP 服务器，最后停在空循环里保持任务存活。
  */
 void app_main(void)
 {
+    init_humidifier();
     init_nvs();
+    init_humidity_control();
+    init_stepper();
     init_rgb_led();
     init_oled();
     init_wifi_station();

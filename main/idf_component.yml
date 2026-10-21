@@ -1,5 +1,7 @@
 # ESP-IDF 组件管理器清单：声明本工程需要的第三方组件。
 # 执行 `idf.py reconfigure` 时会读取本文件，并把依赖下载到 managed_components/ 目录。
 dependencies:
+  # DHT11 单总线温湿度传感器驱动
+  esp-idf-lib/dht: "^1.2.0"
   # WS2812/RGB 灯驱动；^2.5.5 表示接受 2.x 中的兼容版本
   espressif/led_strip: "^2.5.5"

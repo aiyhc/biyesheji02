@@ -3,11 +3,7 @@
   ESP32 AI 控制台 —— 前端单页
   由 gateway.py 在 GET / 时原样返回。
 
-  页面三块功能：
-    1. 聊天区：输入中文指令，POST /api/chat，交给网关 + 本地模型处理；
-    2. 示例按钮：一键填入常用灯光指令；
-    3. 设备区：填写 ESP32 局域网地址（POST /api/device/config），
-       并展示从 /api/device 拿到的设备状态。
+  聊天与语音经网关处理；设备面板读取状态并发送灯光、控湿和窗帘控制请求。
 -->
 <html lang="zh-CN">
 <head>
@@ -19,53 +15,84 @@
     :root {
       color-scheme: light;
       font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-      color: #202522;
-      background: #f4f6f3;
+      color: #1d2926;
+      background: #eff2ef;
+      --ink: #1d2926;
+      --muted: #687671;
+      --line: #dbe2dd;
+      --surface: #fff;
+      --surface-soft: #f7f9f7;
+      --accent: #276b53;
+      --accent-soft: #e8f3ed;
+      --warm: #bd7625;
+      --danger: #a83f36;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; }
-    main { max-width: 760px; margin: 0 auto; padding: 28px 20px 48px; }
+    body { min-width: 320px; margin: 0; }
+    main { max-width: 1280px; margin: 0 auto; padding: 24px 28px 40px; }
 
-    /* ---------- 顶部标题与连接状态 ---------- */
-    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-    h1 { margin: 0; font-size: 24px; font-weight: 650; }
-    #connection { font-size: 13px; color: #59635d; }
+    .app-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+    .brand-lockup { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .brand-mark { display: grid; place-items: center; width: 42px; height: 42px; flex: none; border-radius: 8px; background: #203c36; color: #fff; font-size: 12px; font-weight: 700; }
+    h1 { margin: 0; color: var(--ink); font-size: 22px; font-weight: 700; }
+    .app-subtitle { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
+    #connection { display: inline-flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 12px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); color: #59645f; font-size: 12px; white-space: nowrap; }
+    #connection::before { width: 8px; height: 8px; border-radius: 50%; background: #9aa59f; content: ""; }
+    #connection[data-connected="true"] { border-color: #bcd8c8; background: #eef7f1; color: #245e42; }
+    #connection[data-connected="true"]::before { background: #2c8a55; }
+    .dashboard-grid { display: grid; grid-template-columns: minmax(340px, .92fr) minmax(0, 1.08fr); align-items: start; gap: 30px; padding-top: 22px; }
+    .conversation-panel { position: sticky; top: 16px; display: flex; flex-direction: column; min-width: 0; }
+    .conversation-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .conversation-heading h2 { margin: 0; font-size: 16px; font-weight: 650; }
+    .conversation-heading span { color: var(--muted); font-size: 12px; }
+    .device-column { min-width: 0; }
 
     /* ---------- 示例指令按钮 ---------- */
-    .examples { display: flex; flex-wrap: wrap; gap: 8px; margin: 24px 0 16px; }
-    button, input { font: inherit; }
+    .examples { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 14px 0 12px; }
+    button, input, select { font: inherit; }
+    button { transition: background-color .15s ease, border-color .15s ease, color .15s ease; }
+    button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid #b98232; outline-offset: 2px; }
+    button:not(:disabled):active { transform: translateY(1px); }
+    button:disabled { cursor: not-allowed; }
     .example, #refresh {
-      border: 1px solid #cbd4cd;
+      border: 1px solid #d7e1da;
       border-radius: 6px;
-      background: #fff;
-      color: #25352b;
-      padding: 8px 12px;
+      background: #f7faf7;
+      color: #345348;
+      padding: 7px 11px;
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
       cursor: pointer;
     }
-    .example:hover, #refresh:hover { background: #edf3ee; }
+    .example:hover, #refresh:hover { border-color: #9bbba8; background: var(--accent-soft); }
 
     /* ---------- 聊天消息列表 ---------- */
     #messages {
-      min-height: 280px;
-      max-height: 52vh;
+      min-height: 390px;
+      max-height: 56vh;
       overflow-y: auto;
-      border-top: 1px solid #d9dfda;
-      border-bottom: 1px solid #d9dfda;
-      padding: 14px 0;
+      margin-top: 12px;
+      padding: 4px 4px 2px;
     }
-    .message { margin: 0 0 14px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .message .label { display: block; margin-bottom: 3px; color: #68736b; font-size: 12px; }
-    .message.error { color: #a52c27; } /* 报错消息用红色标注 */
+    .message { max-width: 94%; margin: 0 0 10px; padding: 10px 12px; border: 1px solid #e4e9e5; border-radius: 8px; background: #fff; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message[data-role="user"] { margin-left: auto; border-color: #d8e7dd; background: #edf5f0; }
+    .message[data-role="system"] { max-width: 100%; border-style: dashed; background: transparent; color: #58665f; }
+    .message .label { display: block; margin-bottom: 3px; color: #537064; font-size: 11px; font-weight: 650; }
+    .message.error { border-color: #efd4d1; background: #fff7f6; color: #a52c27; }
 
     /* ---------- 输入与发送 ---------- */
     form { display: flex; gap: 8px; margin-top: 14px; }
-    .device-config { display: flex; gap: 8px; margin-top: 20px; }
+    #chat-form { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: stretch; }
+    #chat-form #command { width: 100%; min-height: 44px; }
+    .device-config { display: flex; gap: 8px; margin-top: 18px; }
     .device-config input { flex: 1; }
     .device-config button {
-      border: 1px solid #9ca9a0;
+      border: 1px solid #cbd5cf;
       border-radius: 6px;
       padding: 0 12px;
-      color: #25352b;
+      color: var(--ink);
       background: white;
       cursor: pointer;
     }
@@ -73,27 +100,30 @@
     input {
       min-width: 0;
       flex: 1;
-      border: 1px solid #aeb9b1;
+      border: 1px solid #ccd6d0;
       border-radius: 6px;
       padding: 11px 12px;
-      background: white;
+      background: var(--surface);
     }
-    input:focus { outline: 2px solid #39835b; outline-offset: 1px; }
+    input:focus, select:focus { outline: 2px solid #b98232; outline-offset: 2px; }
     #send {
+      min-width: 72px;
+      min-height: 44px;
       border: 0;
       border-radius: 6px;
-      padding: 0 18px;
+      padding: 0 16px;
       color: white;
-      background: #26764a;
+      background: #23483f;
       cursor: pointer;
     }
     #send:disabled { opacity: .55; cursor: wait; } /* 请求进行中禁用按钮 */
     #voice-input {
-      border: 1px solid #9ca9a0;
+      min-height: 44px;
+      border: 1px solid #cbd5cf;
       border-radius: 6px;
       padding: 0 12px;
-      color: #25352b;
-      background: white;
+      color: var(--ink);
+      background: var(--surface);
       cursor: pointer;
     }
     #voice-input[aria-pressed="true"] {
@@ -113,38 +143,270 @@
       font-size: 12px;
     }
     .speech-toggle { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
-    .speech-toggle input { flex: none; width: 16px; height: 16px; margin: 0; accent-color: #26764a; }
+    .speech-toggle input { flex: none; width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
     #voice-status { text-align: right; }
 
     /* ---------- 设备状态展示 ---------- */
-    .device-state { margin-top: 20px; }
-    .device-state h2 { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
-    pre {
-      margin: 0;
-      padding: 12px;
-      min-height: 52px;
-      overflow: auto;
+    .device-state { margin-top: 0; padding: 0 0 18px; border-bottom: 1px solid var(--line); }
+    .device-state-header, .brightness-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .device-state h2 { margin: 0; font-size: 15px; font-weight: 600; }
+    #refresh-state {
+      border: 1px solid #cbd5cf;
       border-radius: 6px;
-      background: #e9ede9;
-      font-size: 12px;
+      padding: 6px 10px;
+      color: var(--ink);
+      background: var(--surface);
+      cursor: pointer;
+    }
+    #refresh-state:disabled { opacity: .55; cursor: wait; }
+    .light-summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(150px, .55fr);
+      align-items: center;
+      gap: 20px;
+      padding: 14px 0 8px;
+    }
+    .light-overview { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .light-swatch {
+      flex: none;
+      width: 44px;
+      height: 44px;
+      border: 1px solid #d7dfd9;
+      border-radius: 4px;
+      background: #edf1ed;
+    }
+    .power-line { display: flex; align-items: center; gap: 7px; min-height: 22px; }
+    .power-indicator { width: 9px; height: 9px; border-radius: 50%; background: #89938c; }
+    .power-indicator[data-on="true"] { background: #2d8858; }
+    #light-power { font-size: 15px; }
+    .light-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 3px; color: #59635d; font-size: 12px; }
+    .light-meta strong { color: #202522; font-weight: 600; }
+    .light-meta code { color: #36423a; font-family: Consolas, monospace; }
+    .brightness-block { min-width: 0; }
+    .brightness-heading { margin-bottom: 7px; color: #59635d; font-size: 13px; }
+    #brightness-value { color: #202522; font-size: 14px; }
+    #brightness-meter { display: block; width: 100%; height: 8px; accent-color: var(--accent); }
+    #state-message { min-height: 18px; margin: 2px 0 0; color: #68736b; font-size: 12px; }
+    .humidifier-control-section { margin-top: 0; padding: 18px 0; border-bottom: 1px solid var(--line); }
+    .humidifier-control-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .humidifier-control-section h2 { margin: 0; font-size: 15px; font-weight: 600; }
+    .environment-readings { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0 4px; }
+    .environment-metric { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+    .environment-metric span { color: #59635d; font-size: 13px; }
+    .environment-metric strong { color: #202522; font-size: 20px; font-weight: 600; }
+    .environment-metric small { color: #68736b; font-size: 12px; }
+    #environment-sensor-status, #environment-config-message { min-height: 18px; margin: 4px 0; color: #68736b; font-size: 12px; }
+    #environment-fields { min-width: 0; margin: 8px 0 0; padding: 0; border: 0; }
+    .environment-auto-row, .environment-threshold-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .environment-auto-row { min-height: 42px; border-top: 1px solid #e3e7e3; }
+    .environment-thresholds { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 10px 0 4px; }
+    .environment-threshold-row label { color: #59635d; font-size: 13px; }
+    .environment-threshold-row output { color: #202522; font-size: 14px; font-weight: 600; }
+    .environment-thresholds input[type="range"] {
+      display: block;
+      width: 100%;
+      height: 30px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      accent-color: #26764a;
+    }
+    .switch-input {
+      position: relative;
+      flex: none;
+      width: 46px;
+      height: 26px;
+      min-width: 46px;
+      margin: 0;
+      padding: 0;
+      appearance: none;
+      -webkit-appearance: none;
+      border: 1px solid #aeb9b1;
+      border-radius: 13px;
+      background: #dce1dd;
+      cursor: pointer;
+      transition: background-color .12s ease;
+    }
+    .switch-input::before {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 2px #0002;
+      transition: transform .12s ease;
+    }
+    .switch-input:checked { border-color: #26764a; background: #26764a; }
+    .switch-input:checked::before { transform: translateX(20px); }
+    .switch-input:focus-visible { outline: 2px solid #26764a; outline-offset: 3px; }
+    .switch-input:disabled { opacity: .55; cursor: not-allowed; }
+    #humidifier-fields { min-width: 0; margin: 8px 0 0; padding: 0; border: 0; }
+    .humidifier-switch-row { display: flex; align-items: center; justify-content: space-between; min-height: 42px; }
+    .humidifier-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: #202522;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    #humidifier-message { min-height: 18px; margin: 0; color: #68736b; font-size: 12px; }
+    .curtain-control-section { margin: 0 0 18px; padding: 18px; border: 1px solid #eadfc8; border-left: 3px solid var(--warm); border-radius: 8px; background: #fffdf8; }
+    .curtain-header, .curtain-position-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .curtain-control-section h2, .curtain-control-section h3 { margin: 0; font-size: 15px; font-weight: 600; }
+    .curtain-control-section h3 { font-size: 13px; }
+    #curtain-status, #curtain-calibration-status { color: #68736b; font-size: 12px; text-align: right; }
+    .curtain-position-block { margin-top: 12px; }
+    .curtain-position-heading { color: #59635d; font-size: 13px; }
+    #curtain-position-value, #curtain-target-value { color: #202522; font-size: 15px; font-weight: 600; }
+    #curtain-meter { display: block; width: 100%; height: 8px; margin-top: 8px; accent-color: #26764a; }
+    .curtain-target-control { margin-top: 14px; }
+    #curtain-target, #curtain-jog-interval { display: block; width: 100%; height: 32px; padding: 0; border: 0; background: transparent; accent-color: #26764a; }
+    .curtain-settings { display: grid; grid-template-columns: minmax(110px, .8fr) minmax(100px, .7fr) minmax(150px, 1.5fr); align-items: end; gap: 12px; margin-top: 10px; }
+    .curtain-setting { display: grid; gap: 6px; min-width: 0; color: #59635d; font-size: 13px; }
+    .curtain-setting select, .curtain-setting input[type="number"] { width: 100%; min-height: 40px; padding: 8px 10px; border: 1px solid #aeb9b1; border-radius: 6px; background: #fff; color: #202522; }
+    .curtain-speed-heading { display: flex; justify-content: space-between; gap: 8px; }
+    .curtain-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .curtain-actions button { min-height: 40px; padding: 8px 14px; border: 1px solid #9ca9a0; border-radius: 6px; background: #fff; color: #25352b; cursor: pointer; }
+    #curtain-move { border-color: #26764a; background: #26764a; color: #fff; }
+    #curtain-stop { border-color: #a52c27; color: #a52c27; }
+    .curtain-actions button:disabled, .curtain-setting :disabled { opacity: .55; cursor: not-allowed; }
+    .curtain-calibration { margin-top: 16px; padding-top: 12px; border-top: 1px solid #e3e7e3; }
+    #curtain-note { margin: 8px 0 0; color: #68736b; font-size: 12px; line-height: 1.5; }
+    .manual-controls { margin-top: 12px; padding: 12px 0 0; border-top: 1px solid var(--line); }
+    .manual-controls-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .manual-controls h2 { margin: 0; font-size: 15px; font-weight: 600; }
+    #manual-control-status { color: #68736b; font-size: 12px; text-align: right; }
+    #manual-control-fields { min-width: 0; margin: 12px 0 0; padding: 0; border: 0; }
+    .manual-row { display: grid; grid-template-columns: 52px minmax(0, 1fr); align-items: center; gap: 10px; }
+    .manual-row + .manual-row { margin-top: 18px; }
+    .manual-label { color: #59635d; font-size: 13px; }
+    .manual-color-options { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
+    .color-swatch-button {
+      flex: none;
+      width: 34px;
+      height: 34px;
+      aspect-ratio: 1;
+      padding: 0;
+      border: 1px solid #aeb9b1;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .color-swatch-button[aria-pressed="true"] { outline: 2px solid #26764a; outline-offset: 2px; }
+    .color-swatch-button:focus-visible, #manual-color-picker:focus-visible, #manual-brightness:focus-visible {
+      outline: 2px solid #26764a;
+      outline-offset: 3px;
+    }
+    .custom-color-control { display: inline-flex; align-items: center; gap: 6px; color: #59635d; font-size: 12px; }
+    #manual-color-picker {
+      flex: none;
+      width: 38px;
+      height: 34px;
+      min-width: 38px;
+      padding: 2px;
+      border: 1px solid #aeb9b1;
+      border-radius: 4px;
+      background: #fff;
+      cursor: pointer;
+    }
+    .selected-color { display: inline-flex; align-items: center; gap: 6px; margin-left: 2px; color: #25352b; font-size: 12px; }
+    #manual-color-preview { width: 16px; height: 16px; border: 1px solid #cbd4cd; border-radius: 3px; }
+    .manual-brightness-control { min-width: 0; }
+    #manual-brightness-output { color: #202522; font-size: 14px; }
+    #manual-brightness {
+      display: block;
+      width: 100%;
+      height: 32px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      appearance: none;
+      -webkit-appearance: none;
+      accent-color: #26764a;
+      cursor: pointer;
+    }
+    #manual-brightness::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: #cbd4cd; }
+    #manual-brightness::-webkit-slider-thumb {
+      width: 20px;
+      height: 20px;
+      margin-top: -7px;
+      appearance: none;
+      -webkit-appearance: none;
+      border: 2px solid #fff;
+      border-radius: 50%;
+      background: #26764a;
+      box-shadow: 0 0 0 1px #26764a;
+    }
+    #manual-brightness::-moz-range-track { height: 6px; border-radius: 3px; background: #cbd4cd; }
+    #manual-brightness::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border: 2px solid #fff;
+      border-radius: 50%;
+      background: #26764a;
+      box-shadow: 0 0 0 1px #26764a;
+    }
+    .manual-range-labels { display: flex; justify-content: space-between; color: #68736b; font-size: 11px; }
+
+    @media (max-width: 900px) {
+      main { max-width: 760px; }
+      .dashboard-grid { grid-template-columns: minmax(0, 1fr); gap: 26px; }
+      .conversation-panel { position: static; }
+      #messages { min-height: 260px; max-height: 42vh; }
     }
 
     /* ---------- 窄屏适配 ---------- */
     @media (max-width: 520px) {
-      main { padding: 20px 14px 32px; }
-      header { align-items: flex-start; flex-direction: column; }
-      #messages { min-height: 230px; }
+      main { padding: 16px 14px 30px; }
+      .app-header { align-items: flex-start; flex-direction: column; gap: 12px; }
+      .dashboard-grid { gap: 22px; padding-top: 16px; }
+      .conversation-panel { min-width: 0; }
+      .examples { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #messages { min-height: 220px; max-height: 38vh; padding: 2px; }
+      .message { max-width: 100%; }
+      #chat-form { grid-template-columns: minmax(0, 1fr) minmax(76px, auto); gap: 7px; }
+      #chat-form #command { grid-column: 1 / -1; }
+      #voice-input, #send { min-height: 42px; padding: 0 10px; }
+      .voice-options { align-items: flex-start; }
+      #voice-status { max-width: 58%; }
+      .light-summary { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+      .brightness-block { margin-left: 56px; }
+      .humidifier-control-header { align-items: flex-start; }
+      .device-state-header { align-items: flex-start; }
+      .curtain-header { align-items: flex-start; flex-direction: column; gap: 4px; }
+      .curtain-settings { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+      .curtain-setting-speed { grid-column: 1 / -1; }
+      .manual-controls-header { align-items: flex-start; flex-direction: column; gap: 4px; }
+      .manual-row { grid-template-columns: 46px minmax(0, 1fr); gap: 8px; }
+      .manual-color-options { gap: 7px; }
+      .selected-color { margin-left: 0; }
     }
   </style>
 </head>
 <body>
   <main>
-    <!-- 标题栏：右侧显示设备连接状态 -->
-    <header>
-      <h1>ESP32 控制台</h1>
-      <span id="connection">正在检查设备…</span>
+    <header class="app-header">
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true">S3</span>
+        <div>
+          <h1>ESP32 控制台</h1>
+          <p class="app-subtitle">智能家居设备管理</p>
+        </div>
+      </div>
+      <span id="connection" data-connected="false">正在检查设备…</span>
     </header>
 
+    <div class="dashboard-grid">
+      <section class="conversation-panel" aria-label="AI 对话">
+        <div class="conversation-heading"><h2>AI 对话</h2></div>
     <!-- 常用指令快捷按钮，点击后自动填入并发送 -->
     <div class="examples" aria-label="示例指令">
       <button class="example" type="button" data-text="把灯调成蓝色">蓝灯</button>
@@ -153,16 +415,19 @@
       <button class="example" type="button" data-text="亮绿色和红色，亮度 30%">红绿混色 30%</button>
       <button class="example" type="button" data-text="把灯亮度调到一半">当前颜色 50%</button>
       <button class="example" type="button" data-text="关灯">关灯</button>
+      <button class="example" type="button" data-text="打开窗帘">全开窗帘</button>
+      <button class="example" type="button" data-text="把窗帘打开到 50%">窗帘 50%</button>
+      <button class="example" type="button" data-text="关闭窗帘">全关窗帘</button>
     </div>
 
     <!-- 对话消息区：aria-live 便于读屏软件播报新消息 -->
     <section id="messages" aria-live="polite">
-      <p class="message"><span class="label">系统</span>本地模型已接入。可以正常聊天，也可以控制 RGB 灯的颜色和亮度。</p>
+      <p class="message"><span class="label">助手</span>你好，今天要做什么？</p>
     </section>
 
     <!-- 聊天输入表单 -->
     <form id="chat-form">
-      <input id="command" maxlength="500" autocomplete="off" placeholder="试试：红色和绿色，亮度 30%" required>
+      <input id="command" maxlength="500" autocomplete="off" placeholder="试试：把窗帘打开到 50%" required>
       <button id="voice-input" type="button" aria-pressed="false" title="开始语音识别">语音输入</button>
       <button id="send" type="submit">发送</button>
     </form>
@@ -171,10 +436,167 @@
       <span id="voice-status" role="status" aria-live="polite"></span>
     </div>
 
-    <!-- 设备状态原始 JSON 展示 -->
+      </section>
+      <div class="device-column">
+
+    <section class="curtain-control-section">
+      <div class="curtain-header">
+        <h2>窗帘控制</h2>
+        <span id="curtain-status" role="status" aria-live="polite">连接 ESP32 后可用</span>
+      </div>
+      <div class="curtain-position-block">
+        <div class="curtain-position-heading"><span>当前开合度</span><strong id="curtain-position-value">未知</strong></div>
+        <progress id="curtain-meter" max="100" value="0" aria-label="窗帘当前开合度"></progress>
+      </div>
+      <div class="curtain-target-control">
+        <div class="curtain-position-heading">
+          <label for="curtain-target">目标开合度</label>
+          <output id="curtain-target-value" for="curtain-target">100%</output>
+        </div>
+        <input id="curtain-target" type="range" min="0" max="100" step="1" value="100" aria-label="窗帘目标开合度百分比" disabled>
+        <div class="curtain-actions">
+          <button id="curtain-move" type="button" disabled>移动到目标</button>
+          <button id="curtain-open" type="button" disabled>全开</button>
+          <button id="curtain-close" type="button" disabled>全关</button>
+          <button id="curtain-stop" type="button" disabled>停止</button>
+        </div>
+      </div>
+      <div class="curtain-calibration">
+        <div class="curtain-header">
+          <h3>行程校准</h3>
+          <span id="curtain-calibration-status">未校准</span>
+        </div>
+        <div class="curtain-settings">
+          <label class="curtain-setting" for="curtain-open-direction">
+            打开方向
+            <select id="curtain-open-direction" disabled>
+              <option value="forward">正转时打开</option>
+              <option value="reverse">反转时打开</option>
+            </select>
+          </label>
+          <label class="curtain-setting" for="curtain-jog-steps">
+            点动步数
+            <input id="curtain-jog-steps" type="number" min="1" max="10000" step="1" value="100" inputmode="numeric" disabled>
+          </label>
+          <label class="curtain-setting curtain-setting-speed" for="curtain-jog-interval">
+            <span class="curtain-speed-heading"><span>步进间隔</span><output id="curtain-jog-interval-value" for="curtain-jog-interval">30 ms</output></span>
+            <input id="curtain-jog-interval" type="range" min="5" max="100" step="1" value="30" aria-label="步进间隔毫秒，数值越大越慢" disabled>
+          </label>
+        </div>
+        <div class="curtain-actions">
+          <button id="curtain-set-closed" type="button" disabled>设为全关端点</button>
+          <button id="curtain-jog-open" type="button" disabled>点动打开</button>
+          <button id="curtain-jog-close" type="button" disabled>点动关闭</button>
+          <button id="curtain-set-open" type="button" disabled>设为全开端点</button>
+        </div>
+        <p id="curtain-note">需使用 ULN2003 兼容的单极步进电机。电机用额定外部电源，驱动板与 ESP32 共地，勿用 3.3V 给电机供电。无机械限位检测，点动接近端点时手动停止；断电或手动拉动窗帘后需重新校准。</p>
+      </div>
+    </section>
+
+    <!-- 当前 RGB 灯状态 -->
     <section class="device-state">
-      <h2>ESP32 状态</h2>
-      <pre id="state">尚未读取</pre>
+      <div class="device-state-header">
+        <h2>RGB 灯状态</h2>
+        <button id="refresh-state" type="button" title="刷新灯光状态">刷新</button>
+      </div>
+      <div id="light-summary" class="light-summary" data-connected="false">
+        <div class="light-overview">
+          <span id="light-swatch" class="light-swatch" aria-hidden="true"></span>
+          <div>
+            <div class="power-line">
+              <span id="power-indicator" class="power-indicator" aria-hidden="true"></span>
+              <strong id="light-power">读取中</strong>
+            </div>
+            <div class="light-meta">
+              <span>颜色：<strong id="light-color">--</strong></span>
+              <span>RGB：<code id="light-rgb">--</code></span>
+            </div>
+          </div>
+        </div>
+        <div class="brightness-block">
+          <div class="brightness-heading"><span>亮度</span><strong id="brightness-value">--%</strong></div>
+          <progress id="brightness-meter" max="100" value="0" aria-label="当前亮度"></progress>
+        </div>
+      </div>
+      <p id="state-message" role="status" aria-live="polite">正在读取设备状态…</p>
+      <div class="manual-controls">
+        <div class="manual-controls-header">
+          <h2>手动灯光调节</h2>
+          <span id="manual-control-status" role="status" aria-live="polite">连接 ESP32 后可用</span>
+        </div>
+        <fieldset id="manual-control-fields" disabled>
+          <div class="manual-row">
+            <span class="manual-label">颜色</span>
+            <div class="manual-color-options" role="group" aria-label="选择灯光颜色">
+              <button class="color-swatch-button" type="button" data-color="#ff0000" data-name="红色" aria-label="红色" aria-pressed="false" title="红色" style="background:#ff0000"></button>
+              <button class="color-swatch-button" type="button" data-color="#00ff00" data-name="绿色" aria-label="绿色" aria-pressed="false" title="绿色" style="background:#00ff00"></button>
+              <button class="color-swatch-button" type="button" data-color="#0000ff" data-name="蓝色" aria-label="蓝色" aria-pressed="false" title="蓝色" style="background:#0000ff"></button>
+              <button class="color-swatch-button" type="button" data-color="#ff6000" data-name="黄色" aria-label="黄色" aria-pressed="false" title="黄色" style="background:#ff6000"></button>
+              <button class="color-swatch-button" type="button" data-color="#ffffff" data-name="白色" aria-label="白色" aria-pressed="false" title="白色" style="background:#ffffff"></button>
+              <label class="custom-color-control" title="选择自定义颜色">
+                自定义
+                <input id="manual-color-picker" type="color" value="#ffffff" aria-label="自定义颜色">
+              </label>
+              <span class="selected-color"><span id="manual-color-preview" aria-hidden="true"></span><strong id="manual-color-name">白色</strong></span>
+            </div>
+          </div>
+          <div class="manual-row">
+            <label class="manual-label" for="manual-brightness">亮度</label>
+            <div class="manual-brightness-control">
+              <div class="brightness-heading"><span></span><output id="manual-brightness-output" for="manual-brightness">100%</output></div>
+              <input id="manual-brightness" type="range" min="0" max="100" step="1" value="100" aria-label="手动调节灯光亮度百分比">
+              <div class="manual-range-labels"><span>关</span><span>亮</span></div>
+            </div>
+          </div>
+        </fieldset>
+      </div>
+    </section>
+
+    <section class="humidifier-control-section">
+      <div class="humidifier-control-header">
+        <h2>环境与雾化器</h2>
+        <span id="humidifier-message" role="status" aria-live="polite">连接 ESP32 后可用</span>
+      </div>
+      <div class="environment-readings">
+        <div class="environment-metric"><span>温度</span><strong id="current-temperature">--</strong><small>°C</small></div>
+        <div class="environment-metric"><span>相对湿度</span><strong id="current-humidity">--</strong><small>%</small></div>
+      </div>
+      <p id="environment-sensor-status" role="status" aria-live="polite">等待 DHT11 数据</p>
+      <fieldset id="environment-fields" disabled>
+        <div class="environment-auto-row">
+          <span>自动控湿</span>
+          <label class="humidifier-switch">
+            <input id="humidity-auto-toggle" class="switch-input" type="checkbox" role="switch" aria-label="自动控湿开关">
+            <span id="humidity-auto-mode-label">关闭</span>
+          </label>
+        </div>
+        <div class="environment-thresholds">
+          <div>
+            <div class="environment-threshold-row">
+              <label for="humidity-on-below">开启湿度</label>
+              <output id="humidity-on-below-value" for="humidity-on-below">45%</output>
+            </div>
+            <input id="humidity-on-below" type="range" min="20" max="75" step="1" value="45" aria-label="雾化器开启湿度阈值">
+          </div>
+          <div>
+            <div class="environment-threshold-row">
+              <label for="humidity-off-at">关闭湿度</label>
+              <output id="humidity-off-at-value" for="humidity-off-at">50%</output>
+            </div>
+            <input id="humidity-off-at" type="range" min="25" max="80" step="1" value="50" aria-label="雾化器关闭湿度阈值">
+          </div>
+        </div>
+      </fieldset>
+      <p id="environment-config-message" role="status" aria-live="polite"></p>
+      <fieldset id="humidifier-fields" disabled>
+        <div class="humidifier-switch-row">
+          <span>手动开关</span>
+          <label class="humidifier-switch">
+            <input id="humidifier-toggle" class="switch-input" type="checkbox" role="switch" aria-label="雾化器手动开关">
+            <span id="humidifier-state">未知</span>
+          </label>
+        </div>
+      </fieldset>
     </section>
 
     <!-- ESP32 局域网地址配置 -->
@@ -183,6 +605,8 @@
       <button type="submit">连接设备</button>
     </form>
     <p id="config-result" aria-live="polite"></p>
+      </div>
+    </div>
   </main>
 
   <script>
@@ -195,11 +619,85 @@
     const speakReplies = document.querySelector("#speak-replies");
     const voiceStatus = document.querySelector("#voice-status");
     const connection = document.querySelector("#connection");
-    const state = document.querySelector("#state");
+    const refreshStateButton = document.querySelector("#refresh-state");
+    const lightSummary = document.querySelector("#light-summary");
+    const lightSwatch = document.querySelector("#light-swatch");
+    const powerIndicator = document.querySelector("#power-indicator");
+    const lightPower = document.querySelector("#light-power");
+    const lightColor = document.querySelector("#light-color");
+    const lightRgb = document.querySelector("#light-rgb");
+    const brightnessValue = document.querySelector("#brightness-value");
+    const brightnessMeter = document.querySelector("#brightness-meter");
+    const stateMessage = document.querySelector("#state-message");
+    const humidifierFields = document.querySelector("#humidifier-fields");
+    const humidifierToggle = document.querySelector("#humidifier-toggle");
+    const humidifierState = document.querySelector("#humidifier-state");
+    const humidifierMessage = document.querySelector("#humidifier-message");
+    const curtainStatus = document.querySelector("#curtain-status");
+    const curtainCalibrationStatus = document.querySelector("#curtain-calibration-status");
+    const curtainPositionValue = document.querySelector("#curtain-position-value");
+    const curtainMeter = document.querySelector("#curtain-meter");
+    const curtainTarget = document.querySelector("#curtain-target");
+    const curtainTargetValue = document.querySelector("#curtain-target-value");
+    const curtainMoveButton = document.querySelector("#curtain-move");
+    const curtainOpenButton = document.querySelector("#curtain-open");
+    const curtainCloseButton = document.querySelector("#curtain-close");
+    const curtainStopButton = document.querySelector("#curtain-stop");
+    const curtainOpenDirection = document.querySelector("#curtain-open-direction");
+    const curtainJogSteps = document.querySelector("#curtain-jog-steps");
+    const curtainJogInterval = document.querySelector("#curtain-jog-interval");
+    const curtainJogIntervalValue = document.querySelector("#curtain-jog-interval-value");
+    const curtainSetClosedButton = document.querySelector("#curtain-set-closed");
+    const curtainJogOpenButton = document.querySelector("#curtain-jog-open");
+    const curtainJogCloseButton = document.querySelector("#curtain-jog-close");
+    const curtainSetOpenButton = document.querySelector("#curtain-set-open");
+    const environmentFields = document.querySelector("#environment-fields");
+    const humidityAutoToggle = document.querySelector("#humidity-auto-toggle");
+    const humidityAutoModeLabel = document.querySelector("#humidity-auto-mode-label");
+    const humidityOnBelow = document.querySelector("#humidity-on-below");
+    const humidityOnBelowValue = document.querySelector("#humidity-on-below-value");
+    const humidityOffAt = document.querySelector("#humidity-off-at");
+    const humidityOffAtValue = document.querySelector("#humidity-off-at-value");
+    const currentTemperature = document.querySelector("#current-temperature");
+    const currentHumidity = document.querySelector("#current-humidity");
+    const environmentSensorStatus = document.querySelector("#environment-sensor-status");
+    const environmentConfigMessage = document.querySelector("#environment-config-message");
+    const manualControlFields = document.querySelector("#manual-control-fields");
+    const manualControlStatus = document.querySelector("#manual-control-status");
+    const manualBrightness = document.querySelector("#manual-brightness");
+    const manualBrightnessOutput = document.querySelector("#manual-brightness-output");
+    const manualColorPicker = document.querySelector("#manual-color-picker");
+    const manualColorPreview = document.querySelector("#manual-color-preview");
+    const manualColorName = document.querySelector("#manual-color-name");
+    const colorSwatchButtons = [...document.querySelectorAll(".color-swatch-button")];
     const deviceForm = document.querySelector("#device-form");
     const deviceUrlInput = document.querySelector("#device-url");
     const configResult = document.querySelector("#config-result");
     const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let refreshingDevice = false;
+    const savedManualColor = localStorage.getItem("esp32-manual-color") || "#ffffff";
+    let selectedColorHex = /^#[0-9a-f]{6}$/i.test(savedManualColor) ? savedManualColor.toLowerCase() : "#ffffff";
+    const initialColorSwatch = colorSwatchButtons.find((button) => button.dataset.color === selectedColorHex);
+    let selectedColorName = initialColorSwatch?.dataset.name || (selectedColorHex === "#ffffff" ? "白色" : "自定义颜色");
+    let humidifierOn = false;
+    let humidifierRequestInFlight = false;
+    let humidityAutoMode = false;
+    let environmentRequestInFlight = false;
+    let curtainRequestInFlight = false;
+    let curtainBusy = false;
+    let curtainSupported = false;
+    let curtainCalibrated = false;
+    let curtainPositionValid = false;
+    let curtainCalibrationStage = 0;
+    let curtainTargetDirty = false;
+    let curtainOpenDirectionOnDevice = "forward";
+    let curtainDirectionDirty = false;
+    let deviceConnected = false;
+    let manualControlsDirty = false;
+    let manualRequestInFlight = false;
+    let manualUpdateQueued = false;
+    let manualRevision = 0;
+    let manualDebounceTimer = null;
     let recognition = null;
     let isListening = false;
     let finalTranscript = "";
@@ -219,6 +717,7 @@
     function addMessage(label, text, isError = false) {
       const item = document.createElement("p");
       item.className = `message${isError ? " error" : ""}`; // 出错时套用红色样式
+      item.dataset.role = label === "你" ? "user" : label === "系统" ? "system" : "assistant";
       const heading = document.createElement("span");
       heading.className = "label";
       heading.textContent = label;
@@ -253,6 +752,454 @@
       };
       window.speechSynthesis.speak(utterance);
     }
+
+    function hexToRgb(hex) {
+      const normalized = hex.replace("#", "");
+      return [0, 2, 4].map((offset) => Number.parseInt(normalized.slice(offset, offset + 2), 16));
+    }
+
+    function rgbToHex(rgb) {
+      return `#${rgb.map((value) => Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0")).join("")}`;
+    }
+
+    function updateManualColorPreview() {
+      const brightness = Number(manualBrightness.value);
+      const previewRgb = hexToRgb(selectedColorHex).map((value) => Math.floor((value * brightness + 50) / 100));
+      manualBrightnessOutput.value = `${brightness}%`;
+      manualBrightnessOutput.textContent = `${brightness}%`;
+      manualColorPicker.value = selectedColorHex;
+      manualColorPreview.style.backgroundColor = `rgb(${previewRgb.join(", ")})`;
+      manualColorName.textContent = selectedColorName;
+      colorSwatchButtons.forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.color === selectedColorHex));
+      });
+    }
+
+    function selectManualColor(hex, name, persist = true) {
+      selectedColorHex = hex.toLowerCase();
+      selectedColorName = name;
+      if (persist) localStorage.setItem("esp32-manual-color", selectedColorHex);
+      updateManualColorPreview();
+    }
+
+    function syncManualControls(light) {
+      manualBrightness.value = String(light.brightness);
+      if (light.on) {
+        const peak = Math.max(light.rgb.r, light.rgb.g, light.rgb.b);
+        const baseRgb = [light.rgb.r, light.rgb.g, light.rgb.b]
+          .map((value) => Math.round(value * 255 / peak));
+        const baseHex = rgbToHex(baseRgb);
+        const matchingSwatch = colorSwatchButtons.find((button) => button.dataset.color === baseHex);
+        selectManualColor(baseHex, matchingSwatch?.dataset.name || light.color, false);
+      } else {
+        updateManualColorPreview();
+      }
+    }
+
+    function scheduleManualLightUpdate(immediate = false) {
+      manualRevision += 1;
+      manualControlsDirty = true;
+      manualControlStatus.textContent = "待应用";
+      updateManualColorPreview();
+      if (manualDebounceTimer !== null) window.clearTimeout(manualDebounceTimer);
+      if (immediate) {
+        manualDebounceTimer = null;
+        sendManualLightUpdate();
+      } else {
+        manualDebounceTimer = window.setTimeout(() => {
+          manualDebounceTimer = null;
+          sendManualLightUpdate();
+        }, 180);
+      }
+    }
+
+    async function sendManualLightUpdate() {
+      if (manualControlFields.disabled) return;
+      if (manualRequestInFlight) {
+        manualUpdateQueued = true;
+        return;
+      }
+
+      manualRequestInFlight = true;
+      do {
+        manualUpdateQueued = false;
+        const revision = manualRevision;
+        const [r, g, b] = hexToRgb(selectedColorHex);
+        const payload = {
+          rgb: { r, g, b },
+          brightness: Number(manualBrightness.value)
+        };
+        manualControlStatus.textContent = "正在更新…";
+        try {
+          const response = await fetch("/api/light", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const data = await response.json();
+          if (!response.ok || !data.ok) throw new Error(data.error || "手动调节失败");
+          renderLightState(data.light, revision === manualRevision);
+          if (revision === manualRevision) {
+            manualControlsDirty = false;
+            manualControlStatus.textContent = "已应用";
+          }
+        } catch (error) {
+          if (revision === manualRevision) manualControlStatus.textContent = error.message;
+        }
+      } while (manualUpdateQueued);
+      manualRequestInFlight = false;
+    }
+
+    colorSwatchButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        selectManualColor(button.dataset.color, button.dataset.name);
+        scheduleManualLightUpdate(true);
+      });
+    });
+
+    function handleCustomColorChange() {
+      const matchingSwatch = colorSwatchButtons.find((button) => button.dataset.color === manualColorPicker.value.toLowerCase());
+      selectManualColor(manualColorPicker.value, matchingSwatch?.dataset.name || "自定义颜色");
+      scheduleManualLightUpdate(false);
+    }
+
+    manualColorPicker.addEventListener("input", handleCustomColorChange);
+    manualColorPicker.addEventListener("change", () => scheduleManualLightUpdate(true));
+    manualBrightness.addEventListener("input", () => scheduleManualLightUpdate(false));
+    manualBrightness.addEventListener("change", () => scheduleManualLightUpdate(true));
+
+    function updateHumidityThresholdLabels() {
+      humidityOnBelowValue.value = `${humidityOnBelow.value}%`;
+      humidityOnBelowValue.textContent = `${humidityOnBelow.value}%`;
+      humidityOffAtValue.value = `${humidityOffAt.value}%`;
+      humidityOffAtValue.textContent = `${humidityOffAt.value}%`;
+    }
+
+    function renderEnvironmentState(data) {
+      humidityAutoMode = data.auto_mode === true;
+      humidityAutoToggle.checked = humidityAutoMode;
+      humidityAutoModeLabel.textContent = humidityAutoMode ? "开启" : "关闭";
+      if (Number.isInteger(data.on_below_pct)) humidityOnBelow.value = String(data.on_below_pct);
+      if (Number.isInteger(data.off_at_pct)) humidityOffAt.value = String(data.off_at_pct);
+      updateHumidityThresholdLabels();
+      environmentFields.disabled = !deviceConnected;
+
+      const hasReading = data.sensor_ok === true
+        && Number.isFinite(Number(data.temperature_c))
+        && Number.isFinite(Number(data.humidity_pct));
+      if (hasReading) {
+        currentTemperature.textContent = Number(data.temperature_c).toFixed(1);
+        currentHumidity.textContent = Number(data.humidity_pct).toFixed(1);
+        environmentSensorStatus.textContent = "DHT11 数据正常";
+      } else {
+        currentTemperature.textContent = "--";
+        currentHumidity.textContent = "--";
+        environmentSensorStatus.textContent = "DHT11 暂无有效读数";
+      }
+
+      if (!environmentRequestInFlight) {
+        environmentConfigMessage.textContent = humidityAutoMode ? "自动控湿已启用" : "自动控湿已关闭";
+      }
+      humidifierFields.disabled = !deviceConnected || humidityAutoMode;
+      if (humidityAutoMode) humidifierMessage.textContent = "自动控湿中";
+    }
+
+    async function updateEnvironmentConfig() {
+      if (!deviceConnected || environmentRequestInFlight) return;
+      environmentRequestInFlight = true;
+      environmentFields.disabled = true;
+      humidifierFields.disabled = true;
+      environmentConfigMessage.textContent = "正在保存…";
+      const payload = {
+        auto_mode: humidityAutoToggle.checked,
+        on_below_pct: Number(humidityOnBelow.value),
+        off_at_pct: Number(humidityOffAt.value)
+      };
+      let refreshAfterFailure = false;
+      try {
+        const response = await fetch("/api/environment/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "自动控湿设置失败");
+        humidityAutoMode = data.auto_mode === true;
+        humidityAutoToggle.checked = humidityAutoMode;
+        humidityAutoModeLabel.textContent = humidityAutoMode ? "开启" : "关闭";
+        humidityOnBelow.value = String(data.on_below_pct);
+        humidityOffAt.value = String(data.off_at_pct);
+        updateHumidityThresholdLabels();
+        renderHumidifierState(data.humidifier_on === true);
+        environmentConfigMessage.textContent = "设置已保存";
+      } catch (error) {
+        environmentConfigMessage.textContent = error.message;
+        refreshAfterFailure = true;
+      } finally {
+        environmentRequestInFlight = false;
+        environmentFields.disabled = !deviceConnected;
+        humidifierFields.disabled = !deviceConnected || humidityAutoMode;
+      }
+      if (refreshAfterFailure) refreshDevice();
+    }
+
+    function updateHumidityThreshold(changedInput) {
+      let onBelow = Number(humidityOnBelow.value);
+      let offAt = Number(humidityOffAt.value);
+      const minGap = 3;
+      const maxGap = 15;
+      if (changedInput === humidityOnBelow) {
+        if (offAt - onBelow < minGap) offAt = onBelow + minGap;
+        if (offAt - onBelow > maxGap) offAt = onBelow + maxGap;
+        offAt = Math.min(80, offAt);
+        humidityOffAt.value = String(offAt);
+      } else {
+        if (offAt - onBelow < minGap) onBelow = offAt - minGap;
+        if (offAt - onBelow > maxGap) onBelow = offAt - maxGap;
+        onBelow = Math.max(20, onBelow);
+        humidityOnBelow.value = String(onBelow);
+      }
+      updateHumidityThresholdLabels();
+      environmentConfigMessage.textContent = "设置尚未保存";
+    }
+
+    humidityAutoToggle.addEventListener("change", updateEnvironmentConfig);
+    humidityOnBelow.addEventListener("input", () => updateHumidityThreshold(humidityOnBelow));
+    humidityOnBelow.addEventListener("change", updateEnvironmentConfig);
+    humidityOffAt.addEventListener("input", () => updateHumidityThreshold(humidityOffAt));
+    humidityOffAt.addEventListener("change", updateEnvironmentConfig);
+
+    function updateCurtainControls() {
+      const unavailable = !deviceConnected || !curtainSupported;
+      const moving = curtainBusy || curtainRequestInFlight;
+      const canSetPosition = unavailable || !curtainCalibrated || !curtainPositionValid || moving || curtainDirectionDirty;
+      curtainTarget.disabled = canSetPosition;
+      curtainMoveButton.disabled = canSetPosition;
+      curtainOpenButton.disabled = canSetPosition;
+      curtainCloseButton.disabled = canSetPosition;
+      curtainStopButton.disabled = unavailable || !curtainBusy || curtainRequestInFlight;
+
+      const canCalibrate = !unavailable && !moving;
+      const directionNeedsApply = curtainCalibrationStage === 1 && curtainDirectionDirty;
+      curtainOpenDirection.disabled = !canCalibrate;
+      curtainJogSteps.disabled = !canCalibrate;
+      curtainJogInterval.disabled = !canCalibrate;
+      curtainSetClosedButton.disabled = !canCalibrate;
+      curtainJogOpenButton.disabled = !canCalibrate || curtainCalibrationStage !== 1 || directionNeedsApply;
+      curtainJogCloseButton.disabled = !canCalibrate || curtainCalibrationStage !== 1 || directionNeedsApply;
+      curtainSetOpenButton.disabled = !canCalibrate || curtainCalibrationStage !== 1 || directionNeedsApply;
+    }
+
+    function renderCurtainState(state) {
+      curtainSupported = Boolean(state && typeof state === "object");
+      curtainBusy = curtainSupported && state.busy === true;
+      curtainCalibrated = curtainSupported && state.calibrated === true;
+      curtainPositionValid = curtainSupported && state.position_valid === true;
+      curtainCalibrationStage = curtainSupported ? Number(state.calibration_stage) || 0 : 0;
+
+      if (!curtainSupported) {
+        curtainTargetDirty = false;
+        curtainDirectionDirty = false;
+        curtainStatus.textContent = deviceConnected ? "请更新 ESP32 固件以启用窗帘控制" : "请先连接 ESP32";
+        curtainCalibrationStatus.textContent = "未校准";
+        curtainPositionValue.textContent = "未知";
+        curtainMeter.value = 0;
+      } else {
+        if (["forward", "reverse"].includes(state.open_direction)) {
+          curtainOpenDirectionOnDevice = state.open_direction;
+          if (!curtainDirectionDirty) curtainOpenDirection.value = state.open_direction;
+        }
+        const positionPct = Number(state.position_pct);
+        const hasEstimate = Number.isFinite(positionPct) && positionPct >= 0;
+        const remaining = Number.isFinite(Number(state.remaining_steps)) ? Number(state.remaining_steps) : 0;
+        if (curtainBusy) {
+          const direction = state.moving_toward_open ? "正在打开" : "正在关闭";
+          curtainStatus.textContent = `${direction} · 剩余 ${remaining} 步`;
+          curtainPositionValue.textContent = hasEstimate ? `${positionPct}%（估算）` : `校准点动 ${state.position_steps} 步`;
+          curtainCalibrationStatus.textContent = curtainCalibrated ? `已校准 · ${state.travel_steps} 步` : "校准中";
+          curtainMeter.value = hasEstimate ? positionPct : 0;
+        } else if (curtainCalibrationStage === 1) {
+          curtainStatus.textContent = "正在校准全开行程";
+          curtainCalibrationStatus.textContent = curtainDirectionDirty
+            ? "方向已变更，请在全关位置重新设定"
+            : `累计 ${state.position_steps} 步`;
+          curtainPositionValue.textContent = "校准中";
+          curtainMeter.value = 0;
+        } else if (curtainCalibrated && curtainPositionValid) {
+          curtainStatus.textContent = curtainDirectionDirty ? "打开方向已更改，请重新校准" : `已校准 · 行程 ${state.travel_steps} 步`;
+          curtainCalibrationStatus.textContent = curtainDirectionDirty ? "方向待应用" : `已校准 · ${state.travel_steps} 步`;
+          curtainPositionValue.textContent = `${positionPct}%`;
+          curtainMeter.value = positionPct;
+          if (!curtainTargetDirty || Number(curtainTarget.value) === positionPct) {
+            curtainTarget.value = String(positionPct);
+            curtainTargetValue.textContent = `${positionPct}%`;
+            curtainTargetDirty = false;
+          }
+        } else {
+          curtainStatus.textContent = curtainCalibrated ? "位置不确定，请重新校准" : "未校准";
+          curtainCalibrationStatus.textContent = curtainCalibrated ? "位置未确认" : "未校准";
+          curtainPositionValue.textContent = "未知";
+          curtainMeter.value = 0;
+        }
+      }
+      updateCurtainControls();
+    }
+
+    async function sendCurtainRequest(payload) {
+      if (!deviceConnected || !curtainSupported || curtainRequestInFlight) return;
+      if (curtainBusy && payload.operation !== "stop") return;
+      curtainRequestInFlight = true;
+      if (payload.operation === "set_position") curtainTargetDirty = true;
+      if (["stop", "set_closed", "set_open"].includes(payload.operation)) curtainTargetDirty = false;
+      curtainStatus.textContent = payload.operation === "stop" ? "正在停止…" : "正在执行…";
+      updateCurtainControls();
+      try {
+        const response = await fetch("/api/curtain", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "窗帘操作失败");
+        if (payload.operation === "set_closed") curtainDirectionDirty = false;
+        renderCurtainState(data.curtain);
+      } catch (error) {
+        curtainStatus.textContent = error.message;
+      } finally {
+        curtainRequestInFlight = false;
+        updateCurtainControls();
+        refreshDevice();
+      }
+    }
+
+    function sendCurtainPosition(positionPct) {
+      curtainTarget.value = String(positionPct);
+      curtainTargetValue.textContent = `${positionPct}%`;
+      curtainTargetDirty = true;
+      sendCurtainRequest({
+        operation: "set_position",
+        position_pct: positionPct,
+        interval_ms: Number(curtainJogInterval.value)
+      });
+    }
+
+    curtainTarget.addEventListener("input", () => {
+      curtainTargetDirty = true;
+      curtainTargetValue.textContent = `${curtainTarget.value}%`;
+    });
+    curtainMoveButton.addEventListener("click", () => sendCurtainPosition(Number(curtainTarget.value)));
+    curtainOpenButton.addEventListener("click", () => sendCurtainPosition(100));
+    curtainCloseButton.addEventListener("click", () => sendCurtainPosition(0));
+    curtainStopButton.addEventListener("click", () => sendCurtainRequest({ operation: "stop" }));
+    curtainSetClosedButton.addEventListener("click", () => sendCurtainRequest({
+      operation: "set_closed",
+      open_direction: curtainOpenDirection.value
+    }));
+    curtainJogOpenButton.addEventListener("click", () => sendCurtainRequest({
+      operation: "jog",
+      direction: "open",
+      steps: Number(curtainJogSteps.value),
+      interval_ms: Number(curtainJogInterval.value)
+    }));
+    curtainJogCloseButton.addEventListener("click", () => sendCurtainRequest({
+      operation: "jog",
+      direction: "close",
+      steps: Number(curtainJogSteps.value),
+      interval_ms: Number(curtainJogInterval.value)
+    }));
+    curtainSetOpenButton.addEventListener("click", () => sendCurtainRequest({ operation: "set_open" }));
+    curtainJogInterval.addEventListener("input", () => {
+      curtainJogIntervalValue.textContent = `${curtainJogInterval.value} ms`;
+    });
+    curtainOpenDirection.addEventListener("change", () => {
+      curtainDirectionDirty = curtainOpenDirection.value !== curtainOpenDirectionOnDevice;
+      updateCurtainControls();
+    });
+
+    function clearLightState(message) {
+      deviceConnected = false;
+      lightSummary.dataset.connected = "false";
+      powerIndicator.dataset.on = "false";
+      lightPower.textContent = "未知";
+      lightColor.textContent = "--";
+      lightRgb.textContent = "--";
+      brightnessValue.textContent = "--%";
+      brightnessMeter.value = 0;
+      lightSwatch.style.backgroundColor = "#e9ede9";
+      stateMessage.textContent = message;
+      manualControlFields.disabled = true;
+      manualControlStatus.textContent = "请先连接 ESP32";
+      humidifierFields.disabled = true;
+      humidifierState.textContent = "未知";
+      humidifierMessage.textContent = "请先连接 ESP32";
+      environmentFields.disabled = true;
+      humidityAutoMode = false;
+      humidityAutoToggle.checked = false;
+      humidityAutoModeLabel.textContent = "未知";
+      currentTemperature.textContent = "--";
+      currentHumidity.textContent = "--";
+      environmentSensorStatus.textContent = "等待 DHT11 数据";
+      environmentConfigMessage.textContent = "请先连接 ESP32";
+      renderCurtainState(null);
+    }
+
+    function renderHumidifierState(on) {
+      humidifierOn = on;
+      humidifierToggle.checked = on;
+      humidifierFields.disabled = !deviceConnected || humidityAutoMode;
+      humidifierState.textContent = on ? "开启" : "关闭";
+      if (!humidifierRequestInFlight) {
+        humidifierMessage.textContent = humidityAutoMode ? "由自动控湿管理" : "状态已同步";
+      }
+    }
+
+    async function updateHumidifier() {
+      if (humidifierFields.disabled || humidifierRequestInFlight) return;
+      const requestedOn = humidifierToggle.checked;
+      humidifierRequestInFlight = true;
+      humidifierToggle.disabled = true;
+      humidifierMessage.textContent = "正在更新…";
+      try {
+        const response = await fetch("/api/humidifier", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ on: requestedOn })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "雾化器控制失败");
+        renderHumidifierState(data.humidifier_on === true);
+        humidifierMessage.textContent = data.humidifier_on ? "已开启" : "已关闭";
+      } catch (error) {
+        humidifierToggle.checked = humidifierOn;
+        humidifierState.textContent = humidifierOn ? "开启" : "关闭";
+        humidifierMessage.textContent = error.message;
+      } finally {
+        humidifierRequestInFlight = false;
+        humidifierToggle.disabled = false;
+      }
+    }
+
+    function renderLightState(light, syncManual = false) {
+      if (!light || !light.rgb) throw new Error("网关没有返回灯光状态。");
+      const { r, g, b } = light.rgb;
+      deviceConnected = true;
+      lightSummary.dataset.connected = "true";
+      powerIndicator.dataset.on = String(light.on);
+      lightPower.textContent = light.on ? "开" : "关";
+      lightColor.textContent = light.color;
+      lightRgb.textContent = `${r}, ${g}, ${b}`;
+      brightnessValue.textContent = `${light.brightness}%`;
+      brightnessMeter.value = light.brightness;
+      lightSwatch.style.backgroundColor = light.on ? `rgb(${r}, ${g}, ${b})` : "#e9ede9";
+      stateMessage.textContent = "状态已更新";
+      manualControlFields.disabled = false;
+      humidifierFields.disabled = humidityAutoMode;
+      updateCurtainControls();
+      if (syncManual) syncManualControls(light);
+      if (!manualControlsDirty && !manualRequestInFlight) manualControlStatus.textContent = "已连接";
+    }
+
+    updateManualColorPreview();
 
     if (!window.isSecureContext) {
       voiceInputButton.disabled = true;
@@ -341,17 +1288,31 @@
 
     /** 查询 ESP32 状态，刷新顶部连接提示与状态区 */
     async function refreshDevice() {
+      if (refreshingDevice || manualRequestInFlight || humidifierRequestInFlight || environmentRequestInFlight || curtainRequestInFlight) return;
+      refreshingDevice = true;
+      refreshStateButton.disabled = true;
       try {
-        const response = await fetch("/api/device");
+        const response = await fetch("/api/device", { cache: "no-store" });
         const data = await response.json();
         if (!response.ok || !data.ok) throw new Error(data.error || "设备未响应");
         connection.textContent = "ESP32 已连接";
-        state.textContent = JSON.stringify(data, null, 2);
+        connection.dataset.connected = "true";
+        renderLightState(data.light, !manualControlsDirty && !manualRequestInFlight);
+        renderEnvironmentState(data);
+        renderHumidifierState(data.humidifier_on === true);
+        renderCurtainState(data.curtain);
       } catch (error) {
         connection.textContent = "ESP32 未连接";
-        state.textContent = error.message;
+        connection.dataset.connected = "false";
+        clearLightState(error.message);
+      } finally {
+        refreshingDevice = false;
+        refreshStateButton.disabled = false;
       }
     }
+
+    refreshStateButton.addEventListener("click", refreshDevice);
+    humidifierToggle.addEventListener("change", updateHumidifier);
 
     // ---------- 保存 ESP32 地址 ----------
     deviceForm.addEventListener("submit", async (event) => {
@@ -395,10 +1356,6 @@
         } else {
           addMessage("助手", data.reply);
           speakReply(data.reply);
-          // 如果这次请求动了灯，顺便把返回的设备状态显示出来
-          if (data.device) {
-            state.textContent = JSON.stringify(data.device.state || data.device, null, 2);
-          }
         }
       } catch (error) {
         addMessage("助手", error.message, true);
@@ -426,7 +1383,9 @@
       })
       .catch(() => {
         connection.textContent = "网关未连接";
+        connection.dataset.connected = "false";
       });
+    window.setInterval(refreshDevice, 5000);
   </script>
 </body>
 </html>

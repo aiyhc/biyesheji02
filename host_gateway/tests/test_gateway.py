@@ -11,6 +11,7 @@
 """
 
 import importlib.util
+import json
 import queue
 import unittest
 from pathlib import Path
@@ -29,27 +30,82 @@ class ModelDecisionTests(unittest.TestCase):
     def test_set_light_decision(self):
         """合法的控灯指令应被完整解析出来。"""
         decision = gateway.parse_model_decision(
-            '{"intent":"set_light","colors":["red","green"],"brightness":30,"reply":"好的。"}'
+            '{"intent":"set_light","colors":["red","green"],"brightness":30,"humidifier_on":false,"reply":"好的。"}'
         )
         self.assertEqual(decision["intent"], "set_light")
         self.assertEqual(decision["colors"], ["red", "green"])
         self.assertEqual(decision["brightness"], 30)
+        self.assertFalse(decision["humidifier_on"])
+
+    def test_set_humidifier_decision(self):
+        decision = gateway.parse_model_decision(
+            '{"intent":"set_humidifier","colors":[],"brightness":100,"humidifier_on":true,"reply":"好的。"}'
+        )
+        self.assertEqual(decision["intent"], "set_humidifier")
+        self.assertTrue(decision["humidifier_on"])
+        self.assertEqual(decision["colors"], [])
+
+        off = gateway.parse_model_decision(
+            '{"intent":"set_humidifier","colors":[],"brightness":100,"humidifier_on":false,"reply":"好的。"}'
+        )
+        self.assertFalse(off["humidifier_on"])
+
+    def test_curtain_target_and_stop_decisions(self):
+        decision = gateway.parse_model_decision(
+            '{"intent":"set_curtain","colors":[],"brightness":100,"humidifier_on":false,'
+            '"curtain_position_pct":35,"reply":"打开到35%。"}'
+        )
+        self.assertEqual(decision["curtain_position_pct"], 35)
+
+        stop = gateway.parse_model_decision(
+            '{"intent":"stop_curtain","colors":[],"brightness":100,"humidifier_on":false,'
+            '"curtain_position_pct":0,"reply":"停止窗帘。"}'
+        )
+        self.assertEqual(stop["intent"], "stop_curtain")
+
+        for pct in (-1, 101, True, 25.5):
+            content = (
+                '{"intent":"set_curtain","colors":[],"brightness":100,"humidifier_on":false,'
+                f'"curtain_position_pct":{json.dumps(pct)},"reply":"调整窗帘。"}}'
+            )
+            with self.subTest(pct=pct), self.assertRaises(ValueError):
+                gateway.parse_model_decision(content)
+
+    def test_query_curtain_is_non_actuating(self):
+        decision = gateway.parse_model_decision(
+            '{"intent":"query_curtain","colors":["red"],"brightness":10,"humidifier_on":true,'
+            '"curtain_position_pct":90,"reply":"查询窗帘。"}'
+        )
+        self.assertEqual(decision["intent"], "query_curtain")
+        self.assertEqual(decision["curtain_position_pct"], 0)
+        self.assertFalse(decision["humidifier_on"])
+
+    def test_query_environment_is_non_actuating(self):
+        decision = gateway.parse_model_decision(
+            '{"intent":"query_environment","colors":["red"],"brightness":5,"humidifier_on":true,"reply":"查看当前湿度。"}'
+        )
+        self.assertEqual(decision["intent"], "query_environment")
+        self.assertEqual(decision["colors"], [])
+        self.assertEqual(decision["brightness"], 100)
+        self.assertFalse(decision["humidifier_on"])
 
     def test_non_action_fields_are_ignored(self):
         """聊天意图下，模型多给的颜色/亮度字段必须被清空，避免误控灯。"""
         decision = gateway.parse_model_decision(
-            '{"intent":"chat","colors":["white"],"brightness":45,"reply":"你好。"}'
+            '{"intent":"chat","colors":["white"],"brightness":45,"humidifier_on":true,"reply":"你好。"}'
         )
         self.assertEqual(decision["intent"], "chat")
         self.assertEqual(decision["colors"], [])
         self.assertEqual(decision["brightness"], 100)
+        self.assertFalse(decision["humidifier_on"])
 
     def test_invalid_light_settings_are_rejected(self):
         """非法颜色、超范围亮度、off 与其它颜色混用都应抛 ValueError。"""
         invalid = (
-            '{"intent":"set_light","colors":["purple"],"brightness":30,"reply":"好的。"}',
-            '{"intent":"set_light","colors":["red"],"brightness":101,"reply":"好的。"}',
-            '{"intent":"set_light","colors":["off","red"],"brightness":50,"reply":"好的。"}',
+            '{"intent":"set_light","colors":["purple"],"brightness":30,"humidifier_on":false,"reply":"好的。"}',
+            '{"intent":"set_light","colors":["red"],"brightness":101,"humidifier_on":false,"reply":"好的。"}',
+            '{"intent":"set_light","colors":["off","red"],"brightness":50,"humidifier_on":false,"reply":"好的。"}',
+            '{"intent":"set_humidifier","colors":[],"brightness":100,"humidifier_on":"true","reply":"好的。"}',
         )
         for content in invalid:
             with self.subTest(content=content), self.assertRaises(ValueError):
@@ -128,6 +184,140 @@ class LightCommandTests(unittest.TestCase):
             gateway.compose_light_rgb([], 40, current_rgb=(0, 0, 0), remembered_rgb=(0, 255, 0)),
             ((0, 102, 0), (0, 255, 0)),
         )
+
+
+class LightStateSummaryTests(unittest.TestCase):
+    def test_off_state(self):
+        self.assertEqual(
+            gateway.summarize_light_state({"rgb": {"r": 0, "g": 0, "b": 0}}),
+            {
+                "on": False,
+                "brightness": 0,
+                "color": "无",
+                "rgb": {"r": 0, "g": 0, "b": 0},
+            },
+        )
+
+    def test_dimmed_color_reports_intended_brightness(self):
+        result = gateway.summarize_light_state({"rgb": {"r": 77, "g": 29, "b": 0}})
+        self.assertTrue(result["on"])
+        self.assertEqual(result["brightness"], 30)
+        self.assertEqual(result["color"], "黄色")
+
+    def test_mixed_color_and_custom_rgb(self):
+        cyan = gateway.summarize_light_state({"rgb": {"r": 0, "g": 128, "b": 128}})
+        custom = gateway.summarize_light_state({"rgb": {"r": 128, "g": 64, "b": 20}})
+        self.assertEqual(cyan["color"], "青色")
+        self.assertEqual(custom["color"], "自定义颜色")
+
+    def test_invalid_rgb_is_rejected(self):
+        with self.assertRaises(ValueError):
+            gateway.summarize_light_state({"rgb": {"r": 0, "g": 0}})
+        with self.assertRaises(ValueError):
+            gateway.summarize_light_state({"rgb": {"r": True, "g": 0, "b": 0}})
+
+
+class ManualLightControlTests(unittest.TestCase):
+    def test_manual_settings_and_brightness_scaling(self):
+        rgb, brightness = gateway.parse_manual_light_settings(
+            {"rgb": {"r": 255, "g": 96, "b": 0}, "brightness": 30}
+        )
+        self.assertEqual(rgb, (255, 96, 0))
+        self.assertEqual(brightness, 30)
+        self.assertEqual(gateway.scale_rgb_brightness(rgb, brightness), (77, 29, 0))
+
+    def test_manual_settings_reject_invalid_rgb_or_brightness(self):
+        invalid = (
+            {"rgb": {"r": 256, "g": 0, "b": 0}, "brightness": 50},
+            {"rgb": {"r": 0, "g": 0, "b": 0}, "brightness": -1},
+            {"rgb": {"r": 0, "g": 0, "b": 0}, "brightness": 101},
+            {"rgb": {"r": False, "g": 0, "b": 0}, "brightness": 50},
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                gateway.parse_manual_light_settings(payload)
+
+
+class HumidifierControlTests(unittest.TestCase):
+    def test_explicit_on_off_phrases(self):
+        self.assertIsNone(gateway.explicit_light_settings_from_text("打开雾化器"))
+        self.assertIs(gateway.explicit_humidifier_state_from_text("打开雾化器"), True)
+        self.assertIs(gateway.explicit_humidifier_state_from_text("开启加湿器"), True)
+        self.assertIs(gateway.explicit_humidifier_state_from_text("停止雾化"), False)
+        self.assertIs(gateway.explicit_humidifier_state_from_text("关闭雾化器"), False)
+
+    def test_questions_and_negations_do_not_trigger(self):
+        self.assertIsNone(gateway.explicit_humidifier_state_from_text("雾化器怎么使用"))
+        self.assertIsNone(gateway.explicit_humidifier_state_from_text("雾化器开关是什么"))
+        self.assertTrue(gateway.is_negated_humidifier_request("不要打开雾化器"))
+        self.assertIsNone(gateway.explicit_humidifier_state_from_text("不要打开雾化器"))
+
+    def test_manual_switch_requires_boolean(self):
+        self.assertTrue(gateway.parse_humidifier_request({"on": True}))
+        self.assertFalse(gateway.parse_humidifier_request({"on": False}))
+        for payload in ({}, {"on": "true"}, {"on": 1}):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                gateway.parse_humidifier_request(payload)
+
+    def test_environment_thresholds_are_ordered_and_bounded(self):
+        self.assertEqual(
+            gateway.parse_environment_config({"auto_mode": True, "on_below_pct": 45, "off_at_pct": 50}),
+            {"auto_mode": True, "on_below_pct": 45, "off_at_pct": 50},
+        )
+        invalid = (
+            {"auto_mode": True, "on_below_pct": 52, "off_at_pct": 50},
+            {"auto_mode": False, "on_below_pct": 45, "off_at_pct": 47},
+            {"auto_mode": True, "on_below_pct": 50, "off_at_pct": 68},
+            {"auto_mode": "yes", "on_below_pct": 45, "off_at_pct": 50},
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                gateway.parse_environment_config(payload)
+
+
+class CurtainControlTests(unittest.TestCase):
+    def test_curtain_position_questions_use_device_state(self):
+        self.assertTrue(gateway.explicit_curtain_query_from_text("窗帘现在开到多少了"))
+        self.assertTrue(gateway.explicit_curtain_query_from_text("窗帘大概开几成"))
+        self.assertFalse(gateway.explicit_curtain_query_from_text("打开窗帘"))
+
+    def test_curtain_commands_are_not_parsed_as_light_brightness(self):
+        self.assertIsNone(gateway.explicit_light_settings_from_text("把窗帘打开到30%"))
+
+    def test_manual_curtain_operations(self):
+        self.assertEqual(
+            gateway.parse_curtain_request(
+                {"operation": "set_position", "position_pct": 45, "interval_ms": 20}
+            ),
+            {"operation": "set_position", "position_pct": 45, "interval_ms": 20},
+        )
+        self.assertEqual(
+            gateway.parse_curtain_request({"operation": "set_closed", "open_direction": "reverse"}),
+            {"operation": "set_closed", "open_direction": "reverse"},
+        )
+        self.assertEqual(
+            gateway.parse_curtain_request({"operation": "jog", "direction": "open", "steps": 100, "interval_ms": 30}),
+            {"operation": "jog", "direction": "open", "steps": 100, "interval_ms": 30},
+        )
+        self.assertEqual(gateway.parse_curtain_request({"operation": "stop"}), {"operation": "stop"})
+
+        invalid = (
+            {"operation": "set_position", "position_pct": -1, "interval_ms": 20},
+            {"operation": "set_position", "position_pct": 101, "interval_ms": 20},
+            {"operation": "set_position", "position_pct": True, "interval_ms": 20},
+            {"operation": "set_position", "position_pct": 50, "interval_ms": 4},
+            {"operation": "jog", "direction": "sideways", "steps": 10, "interval_ms": 20},
+            {"operation": "jog", "direction": "close", "steps": 10001, "interval_ms": 20},
+            {"operation": "set_closed", "open_direction": "sideways"},
+            {"operation": "unknown"},
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                gateway.parse_curtain_request(payload)
+
+    def test_negated_curtain_request_is_not_an_action(self):
+        self.assertTrue(gateway.is_negated_curtain_request("不要打开窗帘"))
+        self.assertFalse(gateway.is_negated_curtain_request("把窗帘打开到一半"))
 
 
 @unittest.skipIf(gateway.Image is None, "Pillow is not installed")
