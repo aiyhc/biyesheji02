@@ -1,8 +1,17 @@
 # ESP32 主组件(main)注册文件
-# 告诉构建系统：源文件只有 main.c，头文件搜索路径为当前目录，
+# 告诉构建系统：注册应用入口和各功能模块，头文件搜索路径为当前目录，
 # 并声明依赖的 ESP-IDF 组件（缺任何一个都会在编译时报找不到头文件）。
 idf_component_register(
-    SRCS "main.c"
+    SRCS
+        "main.c"
+        "app_state.c"
+        "bridge_action.c"
+        "bridge_curtain.c"
+        "bridge_http.c"
+        "bridge_humidity.c"
+        "bridge_led.c"
+        "bridge_oled.c"
+        "bridge_wifi.c"
     INCLUDE_DIRS "."
     REQUIRES
         json              # cJSON：解析请求、生成响应
@@ -15,6 +24,7 @@ idf_component_register(
         esp_netif         # 网络接口管理
         esp_timer         # DHT11 采样时间戳
         esp_wifi          # Wi-Fi STA 连接
+        freertos          # 任务、队列、事件组和互斥锁
         led_strip         # 第三方 WS2812 RGB 灯驱动
         nvs_flash         # 非易失存储（Wi-Fi 驱动内部依赖）
 )

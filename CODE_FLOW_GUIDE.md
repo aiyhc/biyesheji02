@@ -16,10 +16,12 @@
   └─ 手动控制请求不经过模型，直接校验并转发
                                   │ HTTP / Wi-Fi
                                   ▼
-ESP32-S3 固件：main/main.c
-  ├─ 校验设备动作 JSON
-  ├─ FreeRTOS 任务驱动 GPIO 和传感器
-  └─ 返回灯、窗帘、雾化器、温湿度和 OLED 状态
+ESP32-S3 固件：main/main.c 调用 main/ 下的功能模块
+  ├─ bridge_http.c / bridge_action.c：设备 HTTP 接口和动作校验
+  ├─ bridge_wifi.c：连接 Wi-Fi
+  ├─ bridge_led.c / bridge_oled.c：RGB 灯和 OLED
+  ├─ bridge_humidity.c：DHT11、雾化器和自动控湿
+  └─ bridge_curtain.c：窗帘步进电机任务与校准
 ```
 
 这里是三个 HTTP 服务：笔记本网关同时提供网页和网关 API；Ollama 提供本机模型 API；ESP32 提供设备 API。Ollama 不是网页服务器。大模型运行在笔记本，不运行在 ESP32；ESP32 收到的是网关已经校验过的简单动作。
@@ -28,7 +30,15 @@ ESP32-S3 固件：main/main.c
 
 | 文件或目录 | 作用 |
 | --- | --- |
-| `main/main.c` | 本工程自己的 ESP32 应用逻辑：Wi-Fi、设备 HTTP 接口、传感器、GPIO、窗帘电机任务 |
+| `main/main.c` | 固件入口，只安排上电初始化顺序并启动 HTTP 服务 |
+| `main/app_config.h` | GPIO 引脚、硬件参数和控制范围 |
+| `main/app_state.h` / `main/app_state.c` | 模块共享的运行状态、FreeRTOS 互斥锁和队列句柄 |
+| `main/bridge_http.c` / `main/bridge_action.c` | 设备 HTTP 路由、JSON 参数检查和控制动作分发 |
+| `main/bridge_wifi.c` | Wi-Fi STA 初始化、断线重连和 IP 事件 |
+| `main/bridge_led.c` | GPIO48 WS2812 初始化、颜色写入和亮度限幅 |
+| `main/bridge_oled.c` | I2C 总线、SSD1306 初始化和位图刷新 |
+| `main/bridge_humidity.c` | GPIO8 雾化器、GPIO4 DHT11、自动控湿与 NVS 设置 |
+| `main/bridge_curtain.c` | ULN2003 GPIO、窗帘步进任务和位置保存 |
 | `main/CMakeLists.txt` | 声明固件编译时需要哪些 ESP-IDF 组件 |
 | `main/idf_component.yml` | 声明 DHT11 和 WS2812 灯带驱动等第三方组件 |
 | `managed_components/` | ESP-IDF 组件管理器下载的依赖代码；通常调用它们的 API，不直接改库源码 |
@@ -38,7 +48,7 @@ ESP32-S3 固件：main/main.c
 | `host_gateway/tests/test_gateway.py` | 网关的 Python 单元测试；不代替电机和传感器的实物测试 |
 | `BRIDGE_SETUP.md` | 工程启动说明；硬件功能变更后需要同步更新 |
 
-**关于 `main.c`：**目前项目自己编写的固件主逻辑基本集中在这一个 C 文件，但“ESP32 相关代码”并不都在其中。Wi-Fi、HTTP Server、GPIO、FreeRTOS、I2C、LCD、NVS 等底层实现来自 ESP-IDF，DHT11 和 RGB 灯带也调用了组件库。ESP-IDF 项目本身就是通过组件组合应用、驱动和系统服务。
+**关于模块边界：**`main.c` 只负责“先初始化什么、再启动什么”；每个 `bridge_*.c` 实现一类功能。`app_config.h` 集中放硬件参数，`app_state.h/.c` 集中声明和保存跨模块共享状态。ESP-IDF、DHT11 和 LED 驱动仍由对应组件提供底层能力。
 
 ## 3. 几个常见词
 
@@ -55,7 +65,7 @@ ESP32-S3 固件：main/main.c
 
 ## 4. ESP32 上电流程
 
-固件入口是 `app_main()`（`main/main.c`）。它按顺序初始化雾化器安全输出、NVS、湿度控制、窗帘 GPIO 和队列、RGB 灯、OLED、Wi-Fi。拿到 Wi-Fi IP 后才启动 ESP32 设备 HTTP Server。
+固件入口是 `app_main()`（`main/main.c`）。它依次调用 `bridge_humidifier_init()`、`bridge_nvs_init()`、`bridge_humidity_init()`、`bridge_curtain_init()`、`bridge_led_init()`、`bridge_oled_init()`、`bridge_wifi_init()`，拿到 Wi-Fi IP 后再调用 `bridge_http_start()`。
 
 窗帘 GPIO 为 IN1=6、IN2=7、IN3=15、IN4=16；启动时四路先输出低电平。DHT11 数据脚是 GPIO4，雾化器控制脚 GPIO8（高电平开启），板载 RGB 使用 GPIO48，OLED 的 SCL/SDA 为 GPIO17/GPIO18。
 
@@ -81,7 +91,7 @@ ESP32-S3 固件：main/main.c
    {"action":"curtain_set_position","position_pct":30,"interval_ms":20}
    ```
 
-7. ESP32 的 `action_handler()` 再校验 JSON、动作参数及窗帘位置是否可信。通过后把动作放入 FreeRTOS 队列；独立电机任务逐步驱动 GPIO。
+7. ESP32 的 `bridge_action_handler()` 再校验 JSON、动作参数及窗帘位置是否可信。通过后把动作放入 FreeRTOS 队列；独立电机任务逐步驱动 GPIO。
 8. ESP32 的 `/api/status` 返回当前灯光、环境和窗帘状态；网关的 `/api/device` 代理该状态。网页收到回复后及之后的定时刷新会更新状态显示。
 
 网页上的窗帘滑块走另一条更短的路径：JavaScript 向网关 `POST /api/curtain`，网关校验后直接转发；**手动滑块不需要调用大模型**。同样，手动灯光和雾化器开关也有直接控制接口。
@@ -134,12 +144,12 @@ ESP32-S3 固件：main/main.c
 
 | 功能 | 当前接线 | 主要代码位置/作用 |
 | --- | --- | --- |
-| 板载 WS2812 RGB | GPIO48 | `init_rgb_led()` 初始化；`set_rgb` 动作设置颜色；亮度在固件中限幅 |
-| 雾化器控制信号 | GPIO8，高电平开启 | 初始化时先输出低电平；`set_humidifier` 控制；自动模式与手动请求互斥 |
-| DHT11 | GPIO4 | `dht11_task()` 周期采样，状态接口返回温度、湿度和数据有效标志 |
+| 板载 WS2812 RGB | GPIO48 | `bridge_led.c` 初始化并写入颜色；亮度在固件中限幅 |
+| 雾化器控制信号 | GPIO8，高电平开启 | `bridge_humidity.c` 初始化、手动控制和自动控湿 |
+| DHT11 | GPIO4 | `bridge_humidity.c` 的 `dht11_task()` 周期采样 |
 | 自动控湿 | DHT11 + GPIO8 | 低于开启阈值开启，高于关闭阈值关闭；默认 45%/50%，设置存 NVS |
-| SSD1306 OLED | SCL=GPIO17、SDA=GPIO18 | ESP32 初始化和接收位图；中文文字由网关/Pillow 渲染后发送 |
-| ULN2003 步进电机 | IN1/2/3/4 = GPIO6/7/15/16 | `stepper_task()` 按四相半步顺序驱动，窗帘位置以累计步数估算 |
+| SSD1306 OLED | SCL=GPIO17、SDA=GPIO18 | `bridge_oled.c` 初始化和刷新；中文由网关/Pillow 渲染后发送 |
+| ULN2003 步进电机 | IN1/2/3/4 = GPIO6/7/15/16 | `bridge_curtain.c` 的 `stepper_task()` 驱动，位置以累计步数估算 |
 | 蜂鸣器 | 尚未接入 | 当前固件没有蜂鸣器 GPIO 初始化或控制动作 |
 
 手机语音输入由浏览器的语音识别接口把声音转成文字；模型收到的是文字，不是 ESP32 上的音频。回复朗读也由浏览器/手机处理。OLED 中文图像由网关生成，ESP32 不负责中文字库排版。
@@ -179,11 +189,11 @@ idf.py -p COMx flash monitor
 ## 11. 推荐阅读顺序
 
 1. 先看本文件第 1 节，画出网页、网关、模型、ESP32 四层。
-2. 在 `main/main.c` 读 `app_main()`，只理解上电初始化顺序。
-3. 接着读 `action_handler()`，找到 `curtain_set_position` 分支；它负责接收、校验设备命令。
-4. 再读 `queue_curtain_command_locked()` 和 `stepper_task()`，理解 HTTP 如何把动作交给 FreeRTOS 队列，任务如何逐步输出 GPIO。
+2. 在 `main/main.c` 读 `app_main()`，只理解上电初始化顺序；再看 `app_config.h` 认识引脚。
+3. 接着读 `bridge_http.c` 和 `bridge_action.c`，找到 `curtain_set_position` 分支；它负责接收、校验设备命令。
+4. 再读 `bridge_action.c` 的队列提交和 `bridge_curtain.c` 的 `stepper_task()`，理解 HTTP 如何把动作交给 FreeRTOS 队列，任务如何逐步输出 GPIO。
 5. 在 `host_gateway/gateway.py` 读 `SYSTEM_PROMPT`、`DECISION_SCHEMA`、`call_ollama()` 和 `parse_model_decision()`，理解模型输入、输出格式和校验。
 6. 再跟 `GatewayHandler.do_POST()` 里的 `/api/chat`，看 `set_curtain` 如何变成 ESP32 动作、`query_curtain` 如何读取真实状态。
 7. 最后看 `host_gateway/web/index.html` 的窗帘区、`sendCurtainRequest()` 和 `refreshDevice()`，理解按钮/滑块怎样发请求和刷新显示。
 
-不要试图一次读完 `main.c`。先只追踪一条命令，例如“把窗帘打开到30%”：记录每一层收到的 JSON、调用的函数和返回状态。能把这条链路讲清楚，再逐个学习 C 语法、HTTP、JSON、任务和锁，理解会容易很多。
+不要试图一次读完所有固件模块。先只追踪一条命令，例如“把窗帘打开到30%”：记录每一层收到的 JSON、调用的函数和返回状态。能把这条链路讲清楚，再逐个学习 C 语法、HTTP、JSON、任务和锁，理解会容易很多。
